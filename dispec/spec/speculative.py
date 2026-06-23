@@ -123,13 +123,21 @@ class SpeculativeEngine:
                 stats.accepted += n_acc
 
                 # 4) Roll back rejected KV; resync caches and carried distributions.
-                #    Target: keep accepted, forward only the correction token.
+                #    Target: keep accepted KV, forward only the correction token.
                 self.tgt_cache.manager.truncate(sid, tgt_start + n_acc)
                 tl2 = self._forward(self.tgt, self.tgt_cache, sid, [emitted[-1]], tgt_start + n_acc)
                 p_next = logits_to_probs(tl2[-1], params)
-                #    Draft (cheap): re-forward the confirmed tokens to resync.
-                self.drf_cache.manager.truncate(sid, m + len(out))
-                dl2 = self._forward(self.drf, self.drf_cache, sid, emitted, m + len(out))
+                #    Draft: accepted draft tokens are already cached (drafting forwarded
+                #    t_1..t_{K-1}); only forward what's missing + the correction token.
+                drf_base = m + len(out)
+                if n_acc <= K - 1:
+                    self.drf_cache.manager.truncate(sid, drf_base + n_acc)
+                    to_fwd = [emitted[-1]]
+                else:  # all K accepted: t_K was never forwarded into the draft cache
+                    self.drf_cache.manager.truncate(sid, drf_base + K - 1)
+                    to_fwd = [draft_tokens[K - 1], emitted[-1]]
+                dl2 = self._forward(self.drf, self.drf_cache, sid, to_fwd,
+                                    self.drf_cache.manager.block_table(sid).num_tokens)
                 q_next = logits_to_probs(dl2[-1], params)
 
                 # 5) Emit, honoring max_new_tokens and EOS.
