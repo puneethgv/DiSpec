@@ -68,12 +68,32 @@ the fix is CUDA graphs / `torch.compile`d forwards to make the draft cheap, not 
 bigger model. (int4 7B was tried specifically to test the "bigger target" hypothesis;
 the profile above is why it didn't help.)
 
+### Phase-3 results — true P/D disaggregation
+
+Prefill and decode run as **separate processes** wired by a pluggable KV-transfer
+engine (`dispec/transport/`, `dispec/workers/`). The decode worker generates from KV
+computed by the prefill worker and shipped over the transport; output is
+**token-for-token identical** to the colocated baseline (verified in tests).
+
+KV-transfer cost (Qwen2.5-7B geometry, RTX 3070):
+
+| prompt len | KV size | TCP transfer | TCP throughput |
+|---|---|---|---|
+| 512 | 29 MB | 99 ms | 0.30 GB/s |
+| 2048 | 117 MB | 350 ms | 0.34 GB/s |
+
+`TcpTransport` (the multi-node fallback) is serialize+copy bound and scales linearly;
+`CudaIpcTransport` hands off the same KV by sharing the GPU buffer's IPC handle —
+zero-copy, O(1) in payload size. This is the concrete argument for on-node IPC/NVLink
+and for an RDMA/NIXL backend over the wire.
+
 ## Roadmap
 
 - **Phase 2 (done, analyzed)** — lossless speculative decoding; wall-clock speedup
   pending overhead reduction (CUDA graphs / compiled forwards), see above.
-- **Phase 3** — true P/D disaggregation: separate prefill/decode/draft processes + a KV
-  transfer engine (CUDA IPC on-node, TCP for multi-node), SLO-aware routing.
+- **Phase 3 (done)** — true P/D disaggregation across processes with a pluggable
+  KV-transfer engine (CUDA IPC zero-copy on-node, TCP multi-node); output matches
+  colocated. Remaining: SLO-aware router + draft-pool autoscaling.
 - **Phase 4** — observability (Prometheus/Grafana), load testing, ablations, vLLM comparison.
 - **Phase 5** — Triton kernels (paged + tree attention), EAGLE draft head, int4.
 
