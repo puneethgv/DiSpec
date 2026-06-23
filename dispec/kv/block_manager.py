@@ -104,6 +104,21 @@ class BlockManager:
         self._tables[child_id] = child
         return child
 
+    def truncate(self, seq_id: int, num_tokens: int) -> None:
+        """Roll a sequence back to `num_tokens` tokens, freeing trailing blocks.
+
+        Used by speculative decoding to discard the KV of rejected draft tokens.
+        """
+        table = self._tables[seq_id]
+        keep = self.blocks_needed(num_tokens)
+        for b in table.block_ids[keep:]:
+            self._ref_count[b] -= 1
+            if self._ref_count[b] == 0:
+                del self._ref_count[b]
+                self._free.append(b)
+        table.block_ids = table.block_ids[:keep]
+        table.num_tokens = num_tokens
+
     def free(self, seq_id: int) -> None:
         """Release a sequence; physical blocks return to the pool at refcount 0."""
         table = self._tables.pop(seq_id, None)
