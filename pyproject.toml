@@ -20,6 +20,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# int4 GPTQ target support (Marlin kernels are JIT-compiled; needs ninja on PATH).
+quant = ["gptqmodel>=7.1", "optimum>=2.2", "ninja", "torchvision"]
 # Reference baseline only; not a runtime dependency of the engine.
 ref = ["vllm"]
 

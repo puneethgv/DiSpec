@@ -47,7 +47,10 @@ class ModelRunner:
         cfg = model.config
         self.cfg = cfg
         self.device = next(model.parameters()).device
-        self.dtype = next(model.parameters()).dtype
+        # Compute dtype = first floating param. Quantized (GPTQ/AWQ) models pack
+        # weights as int32, so we must skip those to find the fp16 compute dtype.
+        self.dtype = next((p.dtype for p in model.parameters() if p.is_floating_point()),
+                          torch.float16)
 
         # HF submodules (handle the .model nesting of *ForCausalLM).
         core = model.model

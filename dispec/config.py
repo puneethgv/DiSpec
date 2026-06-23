@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 TARGET_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 DRAFT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
+# int4 GPTQ target: big enough to be memory-bandwidth-bound (so speculation pays
+# off) while fitting in 8 GB alongside the bf16 draft. Same tokenizer family as the
+# draft, which lossless speculative decoding requires.
+TARGET_MODEL_GPTQ = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
+
 DTYPE = "bfloat16"
 
 

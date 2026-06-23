@@ -34,6 +34,18 @@ def load_tokenizer(name: str):
     return tok
 
 
+def load_gptq(name: str, device: str = "cuda"):
+    """Load a GPTQ-quantized causal LM (int4 packed weights, fp16 compute).
+
+    We don't override dtype — the GPTQ config drives the compute dtype — and load
+    straight onto the device since some quant backends don't support post-hoc .to().
+    The from-scratch runner calls the (quantized) Linear modules transparently.
+    """
+    model = AutoModelForCausalLM.from_pretrained(name, device_map={"": device})
+    model.eval()
+    return model
+
+
 def load_target(dtype: str = DTYPE, device: str = "cuda"):
     return load_model(TARGET_MODEL, dtype, device), load_tokenizer(TARGET_MODEL)
 

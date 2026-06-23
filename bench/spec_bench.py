@@ -14,9 +14,10 @@ import time
 
 import torch
 
-from dispec.config import BENCH_PROMPTS, GenConfig, SpecConfig
+from dispec.config import (BENCH_PROMPTS, TARGET_MODEL_GPTQ, GenConfig, SpecConfig)
 from dispec.engine.engine import LLMEngine
-from dispec.models.loader import build_prompt, load_draft, load_target
+from dispec.models.loader import (build_prompt, load_draft, load_gptq,
+                                  load_target, load_tokenizer)
 from dispec.sampling import SamplingParams
 from dispec.spec.speculative import SpeculativeEngine
 
@@ -25,12 +26,19 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--gptq", action="store_true",
+                    help="use the int4 GPTQ 7B target (memory-bound regime)")
     args = ap.parse_args()
     gen = GenConfig(max_new_tokens=args.max_new, temperature=0.0)
     params = SamplingParams(0.0)
 
-    print("Loading target + draft...")
-    target, tok = load_target()
+    if args.gptq:
+        print(f"Loading int4 GPTQ target ({TARGET_MODEL_GPTQ}) + draft...")
+        target = load_gptq(TARGET_MODEL_GPTQ)
+        tok = load_tokenizer(TARGET_MODEL_GPTQ)
+    else:
+        print("Loading bf16 target + draft...")
+        target, tok = load_target()
     draft, _ = load_draft()
     free, total = torch.cuda.mem_get_info()
     print(f"VRAM used: {(total - free) / 1e9:.2f} GB")
