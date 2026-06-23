@@ -82,3 +82,15 @@ class PagedKVCache:
         """Flat slots for the first `num_tokens` tokens of a sequence (its context)."""
         pos = torch.arange(num_tokens, device=self.device)
         return self.slots_for_positions(block_ids, pos)
+
+    # -- disaggregation: export/import a sequence's KV as portable contiguous tensors --
+    def export_contiguous(self, block_ids: list[int], seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather a sequence's paged KV into contiguous (num_layers, seq_len, H, D) tensors."""
+        slots = self.context_slots(block_ids, seq_len)
+        return self.key[:, slots].contiguous(), self.value[:, slots].contiguous()
+
+    def import_contiguous(self, block_ids: list[int], k: torch.Tensor, v: torch.Tensor) -> None:
+        """Scatter contiguous KV (num_layers, seq_len, H, D) into the paged blocks."""
+        slots = self.context_slots(block_ids, k.shape[1])
+        self.key[:, slots] = k.to(self.key.dtype)
+        self.value[:, slots] = v.to(self.value.dtype)
