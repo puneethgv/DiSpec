@@ -43,10 +43,35 @@ Throughput plateaus because the per-sequence Python attention loop is CPU-bound 
 a fused Triton paged-attention kernel (planned). Correctness, not single-stream speed, is the
 Phase-1 goal.
 
+### Phase-2 results — speculative decoding (lossless)
+
+Sequential speculative decoding with a 0.5B draft + rejection sampling
+(`dispec/spec/`). The acceptance math is unit-tested to reproduce the target
+distribution; on real models it is lossless in practice (greedy output matches
+target-only) at **~50% acceptance, ~3.6 tokens per target iteration**.
+
+Wall-clock speedup, however, is currently **<1×** — and profiling shows exactly why,
+which is the interesting part:
+
+| Forward (7B-int4 target / 0.5B draft) | Time |
+|---|---|
+| Target decode, 1 token | 31.9 ms |
+| **Target verify, 5 tokens** | **32.0 ms** (≈ same as 1) |
+| Draft decode, 1 token | 20.2 ms |
+
+The target forward is **launch-bound**: verifying 5 tokens costs the same as decoding
+1, so speculation's core mechanism — amortizing the target — works perfectly. But the
+*draft* forward also carries ~20 ms of Python/launch overhead (a 0.5B model is only
+~3 ms of real compute), so the K≈5 draft steps cost more than the target call they
+save. **Speculation here is bottlenecked by per-forward overhead, not target size** —
+the fix is CUDA graphs / `torch.compile`d forwards to make the draft cheap, not a
+bigger model. (int4 7B was tried specifically to test the "bigger target" hypothesis;
+the profile above is why it didn't help.)
+
 ## Roadmap
 
-- **Phase 2** — speculative decoding: sequential rejection sampling → tree-based speculation,
-  with provable losslessness.
+- **Phase 2 (done, analyzed)** — lossless speculative decoding; wall-clock speedup
+  pending overhead reduction (CUDA graphs / compiled forwards), see above.
 - **Phase 3** — true P/D disaggregation: separate prefill/decode/draft processes + a KV
   transfer engine (CUDA IPC on-node, TCP for multi-node), SLO-aware routing.
 - **Phase 4** — observability (Prometheus/Grafana), load testing, ablations, vLLM comparison.

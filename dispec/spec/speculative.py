@@ -59,6 +59,14 @@ class SpeculativeEngine:
         self.drf_cache = PagedKVCache.for_model(
             draft_model.config, num_blocks, kv.block_size, self.drf.dtype, str(self.drf.device))
         self.dev = self.tgt.device
+        # Draft and target may pad the (shared) tokenizer to different vocab sizes
+        # (e.g. Qwen2.5 7B=152064 vs 0.5B=151936). Real token ids fall below both,
+        # so we align all distributions to the common size for the rejection math.
+        self.vocab = min(self.tgt.cfg.vocab_size, self.drf.cfg.vocab_size)
+
+    def _probs(self, logits, params):
+        """Logits -> sampling distribution over the common (aligned) vocab."""
+        return logits_to_probs(logits[..., :self.vocab], params)
 
     def _forward(self, runner: ModelRunner, cache: PagedKVCache, sid: int,
                  tokens: list[int], start_pos: int) -> torch.Tensor:
@@ -90,8 +98,8 @@ class SpeculativeEngine:
             # Prefill prompt into both; carry each model's next-token distribution.
             tgt_logits = self._forward(self.tgt, self.tgt_cache, sid, prompt_ids, 0)
             drf_logits = self._forward(self.drf, self.drf_cache, sid, prompt_ids, 0)
-            p_next = logits_to_probs(tgt_logits[-1], params)
-            q_next = logits_to_probs(drf_logits[-1], params)
+            p_next = self._probs(tgt_logits[-1], params)
+            q_next = self._probs(drf_logits[-1], params)
 
             out: list[int] = []
             while len(out) < max_new_tokens:
@@ -103,7 +111,7 @@ class SpeculativeEngine:
                 for _ in range(K - 1):
                     dl = self._forward(self.drf, self.drf_cache, sid, [tok],
                                        self.drf_cache.manager.block_table(sid).num_tokens)
-                    qd = logits_to_probs(dl[-1], params)
+                    qd = self._probs(dl[-1], params)
                     q_stack.append(qd)
                     tok = int(sample_from_probs(qd, generator))
                     draft_tokens.append(tok)
@@ -111,8 +119,8 @@ class SpeculativeEngine:
                 # 2) Target verifies all K drafted tokens in one forward.
                 tgt_start = self.tgt_cache.manager.block_table(sid).num_tokens
                 tl = self._forward(self.tgt, self.tgt_cache, sid, draft_tokens, tgt_start)
-                p_stack = [p_next] + [logits_to_probs(tl[j], params) for j in range(K - 1)]
-                p_bonus = logits_to_probs(tl[K - 1], params)
+                p_stack = [p_next] + [self._probs(tl[j], params) for j in range(K - 1)]
+                p_bonus = self._probs(tl[K - 1], params)
 
                 # 3) Rejection sampling -> lossless prefix + 1 token.
                 emitted, n_acc = rejection_sample(
@@ -126,7 +134,7 @@ class SpeculativeEngine:
                 #    Target: keep accepted KV, forward only the correction token.
                 self.tgt_cache.manager.truncate(sid, tgt_start + n_acc)
                 tl2 = self._forward(self.tgt, self.tgt_cache, sid, [emitted[-1]], tgt_start + n_acc)
-                p_next = logits_to_probs(tl2[-1], params)
+                p_next = self._probs(tl2[-1], params)
                 #    Draft: accepted draft tokens are already cached (drafting forwarded
                 #    t_1..t_{K-1}); only forward what's missing + the correction token.
                 drf_base = m + len(out)
@@ -138,7 +146,7 @@ class SpeculativeEngine:
                     to_fwd = [draft_tokens[K - 1], emitted[-1]]
                 dl2 = self._forward(self.drf, self.drf_cache, sid, to_fwd,
                                     self.drf_cache.manager.block_table(sid).num_tokens)
-                q_next = logits_to_probs(dl2[-1], params)
+                q_next = self._probs(dl2[-1], params)
 
                 # 5) Emit, honoring max_new_tokens and EOS.
                 for t in emitted:

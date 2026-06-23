@@ -26,6 +26,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--num-blocks", type=int, default=512,
+                    help="KV blocks per cache (keep small for the 7B int4 target on 8 GB)")
     ap.add_argument("--gptq", action="store_true",
                     help="use the int4 GPTQ 7B target (memory-bound regime)")
     args = ap.parse_args()
@@ -47,32 +49,39 @@ def main() -> None:
     pids = [tok(p).input_ids for p in prompts]
     eos = tok.eos_token_id
 
-    base = LLMEngine(target, num_blocks=2048)
-    spec = SpeculativeEngine(target, draft, spec=SpecConfig(num_speculative_tokens=args.k),
-                             num_blocks=2048)
-
-    # Warmup both paths.
-    base.generate(pids[0], 8, params, eos_token_id=eos)
-    spec.generate(pids[0], 8, params, eos_token_id=eos)
-
-    base_tps, spec_tps, acc, agree = [], [], [], []
+    nb = args.num_blocks
+    # Phase 1: target-only baseline. Free its cache before building the spec engine
+    # so the (target + draft + baseline) KV pools never coexist on an 8 GB GPU.
+    base = LLMEngine(target, num_blocks=nb)
+    base.generate(pids[0], 8, params, eos_token_id=eos)  # warmup
+    base_tps, base_out = [], []
     for pid in pids:
         torch.cuda.synchronize(); t0 = time.perf_counter()
         b = base.generate(pid, gen.max_new_tokens, params, eos_token_id=eos)
         torch.cuda.synchronize(); bt = time.perf_counter() - t0
         base_tps.append(len(b) / bt)
+        base_out.append(b)
+    del base
+    torch.cuda.empty_cache()
 
+    # Phase 2: speculative decoding.
+    spec = SpeculativeEngine(target, draft, spec=SpecConfig(num_speculative_tokens=args.k),
+                             num_blocks=nb)
+    spec.generate(pids[0], 8, params, eos_token_id=eos)  # warmup
+    spec_tps, acc, agree = [], [], []
+    for pid, b in zip(pids, base_out):
         torch.cuda.synchronize(); t0 = time.perf_counter()
-        s, st = spec.generate(pid, gen.max_new_tokens, params, eos_token_id=eos)
+        s, stt = spec.generate(pid, gen.max_new_tokens, params, eos_token_id=eos)
         torch.cuda.synchronize(); stime = time.perf_counter() - t0
         spec_tps.append(len(s) / stime)
-        acc.append(st.acceptance_rate)
+        acc.append(stt.acceptance_rate)
         k = min(len(b), len(s))
         agree.append(sum(x == y for x, y in zip(b[:k], s[:k])) / k)
 
     import statistics as st
     base_m, spec_m = st.mean(base_tps), st.mean(spec_tps)
-    print("\n== Speculative decoding (Qwen2.5-1.5B target / 0.5B draft, greedy) ==")
+    tag = "7B-int4" if args.gptq else "1.5B-bf16"
+    print(f"\n== Speculative decoding ({tag} target / 0.5B draft, greedy) ==")
     print(f"  target-only      : {base_m:5.1f} tok/s")
     print(f"  speculative (K={args.k}): {spec_m:5.1f} tok/s")
     print(f"  speedup          : {spec_m / base_m:.2f}x")
