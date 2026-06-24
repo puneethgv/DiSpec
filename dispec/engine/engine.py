@@ -16,6 +16,7 @@ from dispec.config import KVConfig
 from dispec.engine.cuda_graph import DEFAULT_BUCKETS, CudaGraphDecoder
 from dispec.engine.model_runner import ModelRunner, SeqMeta
 from dispec.kv.paged_cache import PagedKVCache
+from dispec.kv.prefix_cache import PrefixCache
 from dispec.sampling import SamplingParams, sample
 
 
@@ -23,7 +24,8 @@ class LLMEngine:
     _seq_counter = itertools.count()
 
     def __init__(self, model, kv: KVConfig | None = None, num_blocks: int | None = None,
-                 cuda_graph: bool = False, graph_buckets: tuple[int, ...] = DEFAULT_BUCKETS):
+                 cuda_graph: bool = False, graph_buckets: tuple[int, ...] = DEFAULT_BUCKETS,
+                 prefix_cache: bool = False):
         self.runner = ModelRunner(model)
         kv = kv or KVConfig()
         if num_blocks is None:
@@ -33,6 +35,8 @@ class LLMEngine:
             dtype=self.runner.dtype, device=str(self.runner.device),
         )
         self.block_size = kv.block_size
+        self.prefix_cache = PrefixCache(self.cache.manager, kv.block_size) if prefix_cache else None
+        self.last_prefill_tokens = 0  # tokens actually prefilled on the last generate()
         # Capture decode graphs while the cache is empty (replayed per decode step).
         self.graph = None
         if cuda_graph:
@@ -47,16 +51,28 @@ class LLMEngine:
         seq_id = next(self._seq_counter)
 
         n = len(prompt_ids)
-        table = mgr.allocate(seq_id, n)
+        # Prefix cache: adopt the longest run of cached blocks and prefill only the rest.
+        reuse: list[int] = []
+        if self.prefix_cache is not None:
+            reuse = self.prefix_cache.match(prompt_ids)
+            # Keep at least the final token to prefill (we need its next-token logits).
+            while reuse and len(reuse) * self.block_size >= n:
+                reuse.pop()
+        start = len(reuse) * self.block_size  # tokens already cached
+        table = mgr.allocate(seq_id, n, reuse_blocks=reuse)
         try:
-            ids = torch.tensor(prompt_ids, device=dev, dtype=torch.long)
-            positions = torch.arange(n, device=dev)
-            write_slots = self.cache.context_slots(table.block_ids, n)
+            q = n - start
+            self.last_prefill_tokens = q
+            ids = torch.tensor(prompt_ids[start:], device=dev, dtype=torch.long)
+            positions = torch.arange(start, n, device=dev)
+            write_slots = self.cache.slots_for_positions(table.block_ids, positions)
             hidden = self.runner.forward(
                 ids, positions, write_slots,
-                [SeqMeta(table.block_ids, q_len=n, ctx_len=n)], self.cache,
+                [SeqMeta(table.block_ids, q_len=q, ctx_len=n)], self.cache,
             )
             table.num_tokens = n
+            if self.prefix_cache is not None:
+                self.prefix_cache.insert(prompt_ids, table.block_ids)
             logits = self.runner.logits(hidden[-1:])  # (1, vocab)
             next_id = int(sample(logits, params, generator)[0])
 

@@ -63,16 +63,37 @@ class BlockManager:
         self._ref_count[b] = 1
         return b
 
-    def allocate(self, seq_id: int, num_tokens: int) -> BlockTable:
-        """Create a sequence and reserve enough blocks for `num_tokens` (prefill)."""
+    def allocate(self, seq_id: int, num_tokens: int,
+                 reuse_blocks: list[int] | None = None) -> BlockTable:
+        """Create a sequence and reserve enough blocks for `num_tokens` (prefill).
+
+        `reuse_blocks` are existing physical blocks (e.g. from the prefix cache) to
+        adopt as the sequence's leading blocks; they're shared (refcount bumped) rather
+        than allocated, and only the remaining blocks are taken from the pool.
+        """
         if seq_id in self._tables:
             raise ValueError(f"seq {seq_id} already allocated")
+        reuse = reuse_blocks or []
         n = self.blocks_needed(num_tokens)
-        if n > self.num_free_blocks:
-            raise OutOfBlocksError(f"need {n} blocks, have {self.num_free_blocks}")
-        table = BlockTable(block_ids=[self._alloc_block() for _ in range(n)], num_tokens=num_tokens)
+        n_new = n - len(reuse)
+        if n_new > self.num_free_blocks:
+            raise OutOfBlocksError(f"need {n_new} blocks, have {self.num_free_blocks}")
+        for b in reuse:
+            self._ref_count[b] += 1
+        block_ids = list(reuse) + [self._alloc_block() for _ in range(n_new)]
+        table = BlockTable(block_ids=block_ids, num_tokens=num_tokens)
         self._tables[seq_id] = table
         return table
+
+    # -- explicit reference management (prefix cache pins blocks itself) ------
+    def add_ref(self, block_id: int) -> None:
+        self._ref_count[block_id] += 1
+
+    def release(self, block_id: int) -> None:
+        self._ref_count[block_id] -= 1
+        if self._ref_count[block_id] == 0:
+            del self._ref_count[block_id]
+            self._free.append(block_id)
 
     def append_token(self, seq_id: int) -> tuple[int, int]:
         """Reserve space for one more token (decode step). Returns its slot."""
