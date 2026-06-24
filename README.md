@@ -43,6 +43,12 @@ Throughput plateaus because the per-sequence Python attention loop is CPU-bound 
 a fused Triton paged-attention kernel (planned). Correctness, not single-stream speed, is the
 Phase-1 goal.
 
+**vLLM reference:** on the same model/prompts, vLLM does ~528 tok/s — ~6× DiSpec's
+continuous batching. That gap *is* the value of optimized kernels (PagedAttention/Triton),
+CUDA graphs, and a tuned scheduler — exactly the Phase-5 roadmap. DiSpec implements the same
+*architecture* from scratch and is correct; closing the constant-factor gap is the remaining
+engineering. (Run `bench/vllm_ref.py` in an isolated venv; vLLM ships its own torch.)
+
 ### Phase-2 results — speculative decoding (lossless)
 
 Sequential speculative decoding with a 0.5B draft + rejection sampling
