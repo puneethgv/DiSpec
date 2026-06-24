@@ -12,8 +12,8 @@ the speculative-decoding math, cross-process KV movement — is hand-written. vL
 HuggingFace `generate` show up only as baselines to measure against.
 
 The name comes from two of the features (**Di**saggregation + **Spec**ulative decoding), but
-honestly the engine is broader than that, and the biggest speedups come from the less
-glamorous parts: continuous batching and CUDA graphs.
+the engine is broader than that, and the biggest speedups come from continuous batching and
+CUDA graphs.
 
 ## Why these techniques exist
 
@@ -75,15 +75,14 @@ layers and the launch overhead dominates. CUDA graphs fix that: capturing the de
 makes it 3.6× faster on the 0.5B and 1.7× on the 1.5B, enough to pass HF. Continuous
 batching is the throughput lever.
 
-vLLM is ~6× faster than my continuous batching, and that gap is the honest one: it's
-optimized CUDA/Triton kernels, CUDA graphs everywhere, and years of scheduler tuning. DiSpec
-has the same *architecture* and is correct — closing the constant factor is the remaining
-work, not a redesign. (I also tried Liger kernels; they were *slower* for single-token
-decode because they're tuned for training-size shapes.)
+vLLM is ~6× faster than my continuous batching: it's optimized CUDA/Triton kernels, CUDA
+graphs everywhere, and years of scheduler tuning. DiSpec has the same *architecture* and is
+correct — closing the constant factor is the remaining work, not a redesign. (I also tried
+Liger kernels; they were *slower* for single-token decode because they're tuned for
+training-size shapes.)
 
-**Speculative decoding** is the interesting disappointment. It's lossless and accepts ~50%
-of drafted tokens (~3.6 tokens per target step), but the wall-clock speedup is currently
-**below 1×**. Profiling says exactly why:
+**Speculative decoding** is lossless and accepts ~50% of drafted tokens (~3.6 tokens per
+target step), but the wall-clock speedup is currently **below 1×**. Profiling shows why:
 
 | Forward (7B-int4 target / 0.5B draft) | time |
 |---|---|
@@ -176,5 +175,4 @@ tests/               25 tests
 ```
 
 This is a learning/portfolio project, not a production server — the goal was to build the
-real thing end to end and be able to explain every number above, including the ones that
-didn't go my way.
+real thing end to end and be able to explain every number above.
