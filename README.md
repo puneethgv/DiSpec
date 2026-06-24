@@ -175,18 +175,6 @@ dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Graf
 tests/               25 tests
 ```
 
-## What's left
-
-Roughly in the order I'd do it:
-
-1. **Graph-accelerate the speculative draft loop** — the one change that flips speculative
-   decoding to a real wall-clock win.
-2. **Batched CUDA graphs** for continuous batching — pushes server throughput toward vLLM.
-3. **Triton kernels** — a real paged-attention kernel (and tree-attention for tree
-   speculation), which is where most of the remaining gap to vLLM lives.
-4. **EAGLE draft head** — to push acceptance from ~50% toward 80%+.
-5. **int4 everywhere** — fit a larger target and free up KV memory.
-
 This is a learning/portfolio project, not a production server — the goal was to build the
 real thing end to end and be able to explain every number above, including the ones that
 didn't go my way.
