@@ -94,8 +94,19 @@ and for an RDMA/NIXL backend over the wire.
 - **Phase 3 (done)** — true P/D disaggregation across processes with a pluggable
   KV-transfer engine (CUDA IPC zero-copy on-node, TCP multi-node); output matches
   colocated. Remaining: SLO-aware router + draft-pool autoscaling.
-- **Phase 4** — observability (Prometheus/Grafana), load testing, ablations, vLLM comparison.
+- **Phase 4 (in progress)** — FastAPI serving layer + Prometheus/Grafana observability
+  + Poisson load testing (done); ablations + vLLM comparison (todo).
 - **Phase 5** — Triton kernels (paged + tree attention), EAGLE draft head, int4.
+
+### Serving layer + observability (Phase 4)
+
+A FastAPI server runs the continuous-batching engine on a background scheduler thread
+(`dispec/router/`): async `/generate` handlers submit requests and await futures the
+scheduler resolves on completion. `/metrics` exposes TTFT, TPOT, end-to-end latency,
+throughput, queue depth, and batch size (Prometheus); a Grafana dashboard is in
+`dashboards/`. `bench/load_gen.py` drives it with Poisson arrivals and reports latency
+percentiles + goodput (e.g. 32 reqs @ 8/s → 76 tok/s goodput, with queueing latency
+under overload as expected).
 
 ## Setup
 
@@ -104,9 +115,19 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 .venv/bin/python -m dispec.env_check          # validate GPU / bf16 / triton
 .venv/bin/python -m pytest -q                  # run tests
+
+# benchmarks
 .venv/bin/python -m bench.baseline_hf          # HF baseline
-.venv/bin/python -m bench.dispec_bench         # DiSpec engine
+.venv/bin/python -m bench.dispec_bench         # engine: single-seq vs continuous batching
+.venv/bin/python -m bench.spec_bench           # speculative decoding (add --gptq for int4 7B)
+.venv/bin/python -m bench.disagg_bench         # KV-transfer latency
+
+# serve + load test
+.venv/bin/python -m dispec.router.app          # FastAPI server on :8000 (/generate /metrics)
+.venv/bin/python -m bench.load_gen --rate 8 --n 64
 ```
+
+int4 GPTQ target needs the `quant` extra (`pip install -e ".[quant]"`) and `ninja` on PATH.
 
 ## Layout
 
@@ -118,6 +139,11 @@ dispec/
   kv/                  block_manager.py (paged allocator + COW), paged_cache.py (GPU pool)
   engine/              model_runner.py (from-scratch Qwen2 fwd), engine.py (single-seq)
   sched/               scheduler.py (continuous batching)
-bench/                 baseline_hf.py, dispec_bench.py, common.py
-tests/                 paged cache, runner correctness, scheduler
+  spec/                rejection.py (lossless verify), speculative.py (draft+target)
+  transport/           base/tcp/cuda_ipc — pluggable KV-transfer engine
+  workers/             disaggregated.py — prefill/decode worker processes
+  router/              app.py (FastAPI), server.py (scheduler thread), metrics.py
+bench/                 baseline_hf, dispec_bench, spec_bench, disagg_bench, load_gen
+dashboards/            dispec.json (Grafana)
+tests/                 17+ tests: cache, runner, scheduler, rejection, spec, transport, disagg, server
 ```

@@ -1,0 +1,51 @@
+{
+  "title": "DiSpec Inference Server",
+  "uid": "dispec-main",
+  "schemaVersion": 39,
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1, "title": "Throughput (tokens/s)", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [ { "expr": "rate(dispec_tokens_generated_total[1m])", "legendFormat": "tok/s" } ]
+    },
+    {
+      "id": 2, "title": "Request rate (req/s)", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [ { "expr": "rate(dispec_requests_total[1m])", "legendFormat": "req/s" } ]
+    },
+    {
+      "id": 3, "title": "TTFT p50/p90/p99 (s)", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, rate(dispec_ttft_seconds_bucket[1m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.9, rate(dispec_ttft_seconds_bucket[1m]))", "legendFormat": "p90" },
+        { "expr": "histogram_quantile(0.99, rate(dispec_ttft_seconds_bucket[1m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 4, "title": "TPOT p50/p90 (s)", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, rate(dispec_tpot_seconds_bucket[1m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.9, rate(dispec_tpot_seconds_bucket[1m]))", "legendFormat": "p90" }
+      ]
+    },
+    {
+      "id": 5, "title": "Queue depth", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "dispec_running_requests", "legendFormat": "running" },
+        { "expr": "dispec_waiting_requests", "legendFormat": "waiting" }
+      ]
+    },
+    {
+      "id": 6, "title": "Batch tokens per step (p50)", "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, rate(dispec_batch_tokens_bucket[1m]))", "legendFormat": "tokens/step" }
+      ]
+    }
+  ]
+}
