@@ -13,8 +13,8 @@ the speculative-decoding math, cross-process KV movement — is hand-written. vL
 HuggingFace `generate` show up only as baselines to measure against.
 
 The name comes from two of the features (**Di**saggregation + **Spec**ulative decoding), but
-the engine is broader than that, and the biggest speedups come from continuous batching and
-CUDA graphs.
+the engine is broader than that, and the biggest speedups come from continuous batching, CUDA
+graphs, and a hand-written Triton attention kernel.
 
 ## Why these techniques exist
 
@@ -47,7 +47,10 @@ scheduler, a server).
   mixes prefill and decode tokens in one forward pass, bounded by a token budget, with
   priority-aware admission. No cross-sequence leakage (tested).
 - **CUDA-graph decode** (`dispec/engine/cuda_graph.py`) — captures the decode step as a
-  replayable graph to kill per-layer launch overhead. This is the single biggest win.
+  replayable graph to kill per-layer launch overhead.
+- **Triton paged-attention kernel** (`dispec/engine/triton_attn.py`) — a hand-written
+  fused flash-decoding kernel (online softmax, GQA-aware) that reads the paged cache
+  directly, replacing gather + repeat_kv + SDPA. Optional `attn_backend="triton"`.
 - **Speculative decoding** (`dispec/spec/`) — independent 0.5B draft + rejection sampling,
   lossless (the acceptance math is unit-tested to reproduce the target distribution).
 - **P/D disaggregation** (`dispec/transport/`, `dispec/workers/`) — prefill and decode as
@@ -58,7 +61,7 @@ scheduler, a server).
   `/metrics`, a built-in live `/dashboard`, an optional Grafana stack, SLO priority routing,
   and a draft-pool autoscaler.
 
-30 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
+32 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
 math, spec decoding, transports, disaggregation, CUDA graphs, the HTTP server, the
 autoscaler).
 
@@ -74,18 +77,20 @@ All on Qwen2.5-1.5B, RTX 3070 Laptop (8 GB), bf16, greedy.
 | DiSpec single-sequence, eager | 40 | 0.78× |
 | DiSpec single-sequence + CUDA graph | 68 | 1.32× |
 | DiSpec continuous batching | 86 | 1.66× |
+| DiSpec continuous batching + Triton attention | 169 | 3.3× |
 | *vLLM (reference)* | *528* | *10×* |
 
 The eager engine is slower than HF single-stream — no surprise, it's a Python loop over 28
-layers and the launch overhead dominates. CUDA graphs fix that: capturing the decode step
-makes it 3.6× faster on the 0.5B and 1.7× on the 1.5B, enough to pass HF. Continuous
-batching is the throughput lever.
+layers and the launch overhead dominates. Two things fix it: CUDA graphs (capturing the
+decode step is 3.6× faster on the 0.5B, 1.7× on the 1.5B) and the Triton attention kernel
+(which replaces the per-sequence gather+SDPA in the batched path and nearly doubles
+continuous-batching throughput).
 
-vLLM is ~6× faster than my continuous batching: it's optimized CUDA/Triton kernels, CUDA
-graphs everywhere, and years of scheduler tuning. DiSpec has the same *architecture* and is
-correct — closing the constant factor is the remaining work, not a redesign. (I also tried
-Liger kernels; they were *slower* for single-token decode because they're tuned for
-training-size shapes.)
+vLLM is still ~3× ahead of the Triton path: it has more (fused MLP/QKV, full CUDA-graph
+capture of the batched step, a more tuned scheduler) and years of work behind it. DiSpec has
+the same *architecture* and is correct — the gap is constant factors, and each kernel I add
+closes more of it. (I also tried Liger kernels; they were *slower* for single-token decode
+because they're tuned for training-size shapes.)
 
 **Speculative decoding** is lossless and accepts ~50% of drafted tokens (~3.6 tokens per
 target step), but the wall-clock speedup is currently **below 1×**. Profiling shows why:
@@ -138,7 +143,7 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 
 .venv/bin/python -m dispec.env_check     # check GPU / bf16 / triton
-.venv/bin/python -m pytest -q            # 25 tests
+.venv/bin/python -m pytest -q            # 32 tests
 
 # benchmarks
 .venv/bin/python -m bench.ablations      # the throughput table above
@@ -168,7 +173,8 @@ dispec/
   env_check.py       GPU / bf16 / triton check
   kv/                block_manager.py (paged allocator + COW), paged_cache.py (GPU pool),
                      prefix_cache.py (shared-prefix KV reuse)
-  engine/            model_runner.py (Qwen2 forward), engine.py (single-seq), cuda_graph.py
+  engine/            model_runner.py (Qwen2 forward), engine.py (single-seq),
+                     cuda_graph.py, triton_attn.py (fused paged-attention kernel)
   sched/             scheduler.py (continuous batching + priority admission)
   spec/              rejection.py (lossless verify), speculative.py (draft + target)
   transport/         base / cuda_ipc / tcp — the KV-transfer engine
@@ -178,7 +184,7 @@ dispec/
 bench/               ablations, baseline_hf, dispec_bench, spec_bench, disagg_bench,
                      load_gen, vllm_ref
 dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Grafana config
-tests/               30 tests
+tests/               32 tests
 ```
 
 This is a learning/portfolio project, not a production server — the goal was to build the
