@@ -83,8 +83,11 @@ class ModelRunner:
         quantized model keeps the per-projection path."""
         layers = self.layers
         a0 = layers[0].self_attn
+        if isinstance(a0.q_proj, nn.Identity):
+            raise ValueError("model already fused by another ModelRunner; fuse=True mutates "
+                             "the model in place — use one fused runner per model instance")
         if not (isinstance(a0.q_proj, nn.Linear) and a0.q_proj.weight.is_floating_point()):
-            return False
+            return False  # quantized (GPTQ/AWQ): keep the per-projection module path
         self._qkv_w, self._qkv_b, self._gate_up_w = [], [], []
         for layer in layers:
             a, m = layer.self_attn, layer.mlp

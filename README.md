@@ -69,28 +69,35 @@ autoscaler).
 
 All on Qwen2.5-1.5B, RTX 3070 Laptop (8 GB), bf16, greedy.
 
-**Throughput** — each row adds one technique:
+**Single-sequence** — each row adds one technique (`bench/ablations.py`):
 
 | Config | tok/s | vs HF |
 |---|---|---|
-| HuggingFace `generate` (single stream) | 51 | 1.0× |
+| HuggingFace `generate` | 51 | 1.0× |
 | DiSpec single-sequence, eager | 40 | 0.78× |
 | DiSpec single-sequence + CUDA graph | 68 | 1.32× |
-| DiSpec continuous batching | 86 | 1.66× |
-| DiSpec continuous batching + Triton attention | 169 | 3.3× |
-| *vLLM (reference)* | *528* | *10×* |
 
-The eager engine is slower than HF single-stream — no surprise, it's a Python loop over 28
-layers and the launch overhead dominates. Two things fix it: CUDA graphs (capturing the
-decode step is 3.6× faster on the 0.5B, 1.7× on the 1.5B) and the Triton attention kernel
-(which replaces the per-sequence gather+SDPA in the batched path and nearly doubles
-continuous-batching throughput).
+Eager single-stream is slower than HF — it's a Python loop over 28 layers and launch
+overhead dominates. CUDA-graph capture of the decode step fixes that (3.6× on 0.5B, 1.7× on
+1.5B) and passes HF.
 
-vLLM is still ~3× ahead of the Triton path: it has more (fused MLP/QKV, full CUDA-graph
-capture of the batched step, a more tuned scheduler) and years of work behind it. DiSpec has
-the same *architecture* and is correct — the gap is constant factors, and each kernel I add
-closes more of it. (I also tried Liger kernels; they were *slower* for single-token decode
-because they're tuned for training-size shapes.)
+**Continuous-batching throughput vs vLLM**, matched concurrency, warmed
+(`bench/throughput.py` and `bench/vllm_ref.py`):
+
+| concurrency | DiSpec (Triton + fused) | vLLM | gap |
+|---|---|---|---|
+| 6 | 373 tok/s | 528 | 1.4× |
+| 16 | 858 tok/s | 1337 | 1.6× |
+| 32 | 1426 tok/s | 2498 | 1.75× |
+
+This is the part I'm happiest about: the gap to vLLM went from ~6× to **~1.5×**. The wins
+that got us there, in order of impact: building the per-step attention slot table **once**
+instead of per-layer; a **batched** Triton decode kernel (one launch for the whole batch
+instead of a Python loop over sequences); fused QKV / gate-up GEMMs; and CUDA-graph decode.
+The remaining ~1.5× is full CUDA-graph capture of the *batched* step and FlashAttention-grade
+kernels — real work, diminishing returns. (Liger kernels were tried and were *slower* for
+single-token decode; they target training-size shapes. flash-attn / FlashInfer have no
+torch-2.12/CUDA-13 wheel, so the Triton kernel here is hand-written.)
 
 **Speculative decoding** is lossless and accepts ~50% of drafted tokens (~3.6 tokens per
 target step), but the wall-clock speedup is currently **below 1×**. Profiling shows why:
