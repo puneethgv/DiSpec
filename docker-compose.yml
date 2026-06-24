@@ -1,0 +1,25 @@
+# Observability stack for DiSpec: Prometheus scrapes the server's /metrics and
+# Grafana auto-loads dashboards/dispec.json. Run the DiSpec server on the HOST
+# (python -m dispec.router.app, needs the GPU), then `docker compose up`.
+# Grafana: http://localhost:3000 (admin/admin) — the dashboard is pre-provisioned.
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: dispec-prometheus
+    ports: ["9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: dispec-grafana
+    ports: ["3000:3000"]
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]

@@ -102,11 +102,22 @@ and for an RDMA/NIXL backend over the wire.
 
 A FastAPI server runs the continuous-batching engine on a background scheduler thread
 (`dispec/router/`): async `/generate` handlers submit requests and await futures the
-scheduler resolves on completion. `/metrics` exposes TTFT, TPOT, end-to-end latency,
-throughput, queue depth, and batch size (Prometheus); a Grafana dashboard is in
-`dashboards/`. `bench/load_gen.py` drives it with Poisson arrivals and reports latency
-percentiles + goodput (e.g. 32 reqs @ 8/s → 76 tok/s goodput, with queueing latency
-under overload as expected).
+scheduler resolves on completion. `bench/load_gen.py` drives it with Poisson arrivals
+and reports latency percentiles + goodput (e.g. 32 reqs @ 8/s → 76 tok/s goodput, with
+queueing latency under overload as expected).
+
+**Viewing metrics — two ways:**
+
+1. **Built-in (zero infra):** open `http://localhost:8000/dashboard` — a live page
+   (throughput, queue depth, TTFT/TPOT) backed by `/stats`. Nothing else to install.
+2. **Full Prometheus + Grafana:** the dashboard JSON in `dashboards/` only renders
+   inside Grafana. Bring the stack up with Docker:
+   ```bash
+   python -m dispec.router.app          # server on :8000 (host, uses the GPU)
+   docker compose up -d                 # Prometheus :9090 + Grafana :3000
+   # open http://localhost:3000 -> "DiSpec Inference Server" (auto-provisioned)
+   ```
+   `/metrics` exposes TTFT, TPOT, E2E latency, throughput, queue depth, and batch size.
 
 ## Setup
 
