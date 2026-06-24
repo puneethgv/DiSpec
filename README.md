@@ -66,7 +66,10 @@ The target forward is **launch-bound**: verifying 5 tokens costs the same as dec
 save. **Speculation here is bottlenecked by per-forward overhead, not target size** —
 the fix is CUDA graphs / `torch.compile`d forwards to make the draft cheap, not a
 bigger model. (int4 7B was tried specifically to test the "bigger target" hypothesis;
-the profile above is why it didn't help.)
+the profile above is why it didn't help. `torch.compile(mode="reduce-overhead")` was
+also tried but inductor rejects the forward as written — the HF rotary module call +
+inference-mode tensors break it; the clean unlock is CUDA-graph bucketing of the
+fixed-shape decode step, scoped as Phase 5.)
 
 ### Phase-3 results — true P/D disaggregation
 
