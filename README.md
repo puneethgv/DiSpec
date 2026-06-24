@@ -45,7 +45,8 @@ scheduler, a server).
   same argmax).
 - **Continuous batching** (`dispec/sched/scheduler.py`) — iteration-level scheduling that
   mixes prefill and decode tokens in one forward pass, bounded by a token budget, with
-  priority-aware admission. No cross-sequence leakage (tested).
+  priority-aware admission, and chunked prefill (long prompts slice into the batch
+  instead of stalling decodes). No cross-sequence leakage (tested).
 - **CUDA-graph decode** (`dispec/engine/cuda_graph.py`) — captures the decode step as a
   replayable graph to kill per-layer launch overhead.
 - **Triton paged-attention kernel** (`dispec/engine/triton_attn.py`) — a hand-written
@@ -61,7 +62,7 @@ scheduler, a server).
   `/metrics`, a built-in live `/dashboard`, an optional Grafana stack, SLO priority routing,
   and a draft-pool autoscaler.
 
-32 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
+34 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
 math, spec decoding, transports, disaggregation, CUDA graphs, the HTTP server, the
 autoscaler).
 
@@ -188,10 +189,10 @@ dispec/
   workers/           disaggregated.py — prefill & decode worker processes
   router/            app.py (FastAPI), server.py (scheduler thread), metrics.py,
                      dashboard.py (built-in UI), autoscale.py (draft-pool controller)
-bench/               ablations, baseline_hf, dispec_bench, spec_bench, disagg_bench,
-                     load_gen, vllm_ref
+bench/               ablations, throughput, baseline_hf, dispec_bench, spec_bench,
+                     disagg_bench, load_gen, vllm_ref
 dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Grafana config
-tests/               32 tests
+tests/               34 tests
 ```
 
 This is a learning/portfolio project, not a production server — the goal was to build the
