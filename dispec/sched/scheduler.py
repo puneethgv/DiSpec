@@ -53,8 +53,8 @@ class Request:
 
 class ContinuousBatchingEngine:
     def __init__(self, model, kv: KVConfig | None = None, num_blocks: int = 2048,
-                 max_batch_tokens: int = 2048, attn_backend: str = "native"):
-        self.runner = ModelRunner(model, attn_backend=attn_backend)
+                 max_batch_tokens: int = 2048, attn_backend: str = "native", fuse: bool = False):
+        self.runner = ModelRunner(model, attn_backend=attn_backend, fuse=fuse)
         kv = kv or KVConfig()
         self.block_size = kv.block_size
         self.max_batch_tokens = max_batch_tokens

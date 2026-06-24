@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from dispec.kv.paged_cache import PagedKVCache
 
@@ -42,8 +44,9 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 class ModelRunner:
-    def __init__(self, model, attn_backend: str = "native"):
+    def __init__(self, model, attn_backend: str = "native", fuse: bool = False):
         # attn_backend: "native" (PyTorch SDPA) or "triton" (fused paged kernel for decode).
+        # fuse: precompute fused QKV and gate/up weights (one GEMM each, fewer launches).
         self.model = model
         self.attn_backend = attn_backend
         cfg = model.config
@@ -72,6 +75,32 @@ class ModelRunner:
         self.rotary_emb = core.rotary_emb
         self._rope_dummy = torch.zeros(1, 1, device=self.device, dtype=self.dtype)
 
+        self.fused = self._build_fused() if fuse else False
+
+    def _build_fused(self) -> bool:
+        """Concatenate q/k/v and gate/up weights into one GEMM each, then free the
+        originals (so memory doesn't double). Only for plain float Linear layers; a
+        quantized model keeps the per-projection path."""
+        layers = self.layers
+        a0 = layers[0].self_attn
+        if not (isinstance(a0.q_proj, nn.Linear) and a0.q_proj.weight.is_floating_point()):
+            return False
+        self._qkv_w, self._qkv_b, self._gate_up_w = [], [], []
+        for layer in layers:
+            a, m = layer.self_attn, layer.mlp
+            self._qkv_w.append(torch.cat([a.q_proj.weight, a.k_proj.weight, a.v_proj.weight], 0))
+            if a.q_proj.bias is not None:
+                self._qkv_b.append(torch.cat([a.q_proj.bias, a.k_proj.bias, a.v_proj.bias], 0))
+            else:
+                self._qkv_b.append(None)
+            self._gate_up_w.append(torch.cat([m.gate_proj.weight, m.up_proj.weight], 0))
+            # Free the originals; o_proj/down_proj/act_fn are still used as modules.
+            a.q_proj = a.k_proj = a.v_proj = nn.Identity()
+            m.gate_proj = m.up_proj = nn.Identity()
+        self._qsz = self.num_heads * self.head_dim
+        self._kvsz = self.num_kv_heads * self.head_dim
+        return True
+
     # -- rotary --------------------------------------------------------------
     def rope(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pos_ids = positions[None, :]  # (1, T)
@@ -82,9 +111,16 @@ class ModelRunner:
     def _attention(self, layer, x, cos, sin, write_slots, seq_meta, cache, layer_idx):
         attn = layer.self_attn
         T = x.shape[0]
-        q = attn.q_proj(x).view(T, self.num_heads, self.head_dim)
-        k = attn.k_proj(x).view(T, self.num_kv_heads, self.head_dim)
-        v = attn.v_proj(x).view(T, self.num_kv_heads, self.head_dim)
+        if self.fused:
+            qkv = F.linear(x, self._qkv_w[layer_idx], self._qkv_b[layer_idx])
+            q, k, v = qkv.split([self._qsz, self._kvsz, self._kvsz], dim=-1)
+            q = q.view(T, self.num_heads, self.head_dim)
+            k = k.view(T, self.num_kv_heads, self.head_dim)
+            v = v.view(T, self.num_kv_heads, self.head_dim)
+        else:
+            q = attn.q_proj(x).view(T, self.num_heads, self.head_dim)
+            k = attn.k_proj(x).view(T, self.num_kv_heads, self.head_dim)
+            v = attn.v_proj(x).view(T, self.num_kv_heads, self.head_dim)
 
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
@@ -148,8 +184,14 @@ class ModelRunner:
             h = layer.input_layernorm(x)
             x = x + self._attention(layer, h, cos, sin, write_slots, seq_meta, cache, i)
             h = layer.post_attention_layernorm(x)
-            x = x + layer.mlp(h)
+            x = x + self._mlp(layer, h, i)
         return self.norm(x)
+
+    def _mlp(self, layer, h, i):
+        if not self.fused:
+            return layer.mlp(h)
+        gate, up = F.linear(h, self._gate_up_w[i]).chunk(2, dim=-1)
+        return layer.mlp.down_proj(layer.mlp.act_fn(gate) * up)
 
     def logits(self, hidden: torch.Tensor, indices: torch.Tensor | None = None) -> torch.Tensor:
         if indices is not None:

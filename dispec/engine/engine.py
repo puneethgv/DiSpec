@@ -25,8 +25,8 @@ class LLMEngine:
 
     def __init__(self, model, kv: KVConfig | None = None, num_blocks: int | None = None,
                  cuda_graph: bool = False, graph_buckets: tuple[int, ...] = DEFAULT_BUCKETS,
-                 prefix_cache: bool = False, attn_backend: str = "native"):
-        self.runner = ModelRunner(model, attn_backend=attn_backend)
+                 prefix_cache: bool = False, attn_backend: str = "native", fuse: bool = False):
+        self.runner = ModelRunner(model, attn_backend=attn_backend, fuse=fuse)
         kv = kv or KVConfig()
         if num_blocks is None:
             num_blocks = kv.max_blocks

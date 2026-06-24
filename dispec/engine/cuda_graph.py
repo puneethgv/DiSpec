@@ -52,9 +52,16 @@ class CudaGraphDecoder:
         for i, layer in enumerate(r.layers):
             attn = layer.self_attn
             h = layer.input_layernorm(x)
-            q = attn.q_proj(h).view(1, r.num_heads, r.head_dim)
-            k = attn.k_proj(h).view(1, r.num_kv_heads, r.head_dim)
-            v = attn.v_proj(h).view(1, r.num_kv_heads, r.head_dim)
+            if r.fused:
+                qkv = F.linear(h, r._qkv_w[i], r._qkv_b[i])
+                q, k, v = qkv.split([r._qsz, r._kvsz, r._kvsz], dim=-1)
+                q = q.view(1, r.num_heads, r.head_dim)
+                k = k.view(1, r.num_kv_heads, r.head_dim)
+                v = v.view(1, r.num_kv_heads, r.head_dim)
+            else:
+                q = attn.q_proj(h).view(1, r.num_heads, r.head_dim)
+                k = attn.k_proj(h).view(1, r.num_kv_heads, r.head_dim)
+                v = attn.v_proj(h).view(1, r.num_kv_heads, r.head_dim)
             q = _apply_rope(q, cos, sin)
             k = _apply_rope(k, cos, sin)
             self.cache.key[i].index_copy_(0, wslot, k)
@@ -65,7 +72,7 @@ class CudaGraphDecoder:
                 q.transpose(0, 1), ki.transpose(0, 1), vi.transpose(0, 1),
                 attn_mask=mask[None, None, :])
             x = x + attn.o_proj(oh.transpose(0, 1).reshape(1, r.num_heads * r.head_dim))
-            x = x + layer.mlp(layer.post_attention_layernorm(x))
+            x = x + r._mlp(layer, layer.post_attention_layernorm(x), i)
         return r.lm_head(r.norm(x))
 
     def capture(self) -> None:
