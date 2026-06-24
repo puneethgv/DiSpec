@@ -1,20 +1,19 @@
 # DiSpec — a from-scratch LLM inference engine
 
-DiSpec is an LLM serving engine I wrote from scratch to understand how systems like vLLM
-actually work — by building the pieces myself rather than calling them. It runs real models
-(Qwen2.5) on a single 8 GB laptop GPU and implements the whole path: a paged KV cache with
-prefix sharing, a continuous-batching scheduler, the model forward pass, CUDA-graph decode,
-speculative decoding, prefill/decode disaggregation with KV transfer, and an
-OpenAI-compatible HTTP server with metrics.
+DiSpec is a from-scratch LLM serving engine that implements the internals of systems like
+vLLM directly rather than calling them. It runs real models (Qwen2.5) on a single 8 GB laptop
+GPU and covers the whole path: a paged KV cache with prefix sharing, a continuous-batching
+scheduler, the model forward pass, CUDA-graph decode, speculative decoding, prefill/decode
+disaggregation with KV transfer, and an OpenAI-compatible HTTP server with metrics.
 
-The only thing I lean on PyTorch/HuggingFace for is the raw matmuls (and the pretrained
-weights). Everything around them — cache layout, attention masking, scheduling, sampling,
-the speculative-decoding math, cross-process KV movement — is hand-written. vLLM and
-HuggingFace `generate` show up only as baselines to measure against.
+PyTorch/HuggingFace is used only for the raw matmuls (and the pretrained weights). Everything
+around them — cache layout, attention masking, scheduling, sampling, the speculative-decoding
+math, cross-process KV movement — is implemented here. vLLM and HuggingFace `generate` serve
+only as measurement baselines.
 
 The name comes from two of the features (**Di**saggregation + **Spec**ulative decoding), but
-the engine is broader than that, and the biggest speedups come from continuous batching, CUDA
-graphs, and a hand-written Triton attention kernel.
+the engine is broader than that, and the largest speedups come from continuous batching, CUDA
+graphs, and the Triton attention kernel.
 
 ## Why these techniques exist
 
@@ -39,7 +38,7 @@ scheduler, a server).
 - **Prefix caching** (`dispec/kv/prefix_cache.py`) — requests that share a leading prefix
   (system prompt, few-shot preamble, chat history) reuse cached KV blocks instead of
   re-prefilling them, with LRU eviction under memory pressure.
-- **From-scratch Qwen2 forward** (`dispec/engine/model_runner.py`) — my own rotary
+- **From-scratch Qwen2 forward** (`dispec/engine/model_runner.py`) — custom rotary
   embeddings, grouped-query attention, and right-aligned causal masking over the paged
   cache. Verified against HuggingFace at the logits level (per-position cosine ≈ 0.99995,
   same argmax).
@@ -91,14 +90,14 @@ overhead dominates. CUDA-graph capture of the decode step fixes that (3.6× on 0
 | 16 | 858 tok/s | 1337 | 1.6× |
 | 32 | 1426 tok/s | 2498 | 1.75× |
 
-This is the part I'm happiest about: the gap to vLLM went from ~6× to **~1.5×**. The wins
-that got us there, in order of impact: building the per-step attention slot table **once**
-instead of per-layer; a **batched** Triton decode kernel (one launch for the whole batch
-instead of a Python loop over sequences); fused QKV / gate-up GEMMs; and CUDA-graph decode.
-The remaining ~1.5× is full CUDA-graph capture of the *batched* step and FlashAttention-grade
-kernels — real work, diminishing returns. (Liger kernels were tried and were *slower* for
-single-token decode; they target training-size shapes. flash-attn / FlashInfer have no
-torch-2.12/CUDA-13 wheel, so the Triton kernel here is hand-written.)
+The gap to vLLM narrows from ~6× to **~1.5×**. The changes that account for it, in order of
+impact: building the per-step attention slot table **once** instead of per-layer; a
+**batched** Triton decode kernel (one launch for the whole batch instead of a Python loop over
+sequences); fused QKV / gate-up GEMMs; and CUDA-graph decode. The remaining ~1.5× is full
+CUDA-graph capture of the *batched* step and FlashAttention-grade kernels — diminishing
+returns. (Liger kernels were tried and were *slower* for single-token decode; they target
+training-size shapes. flash-attn / FlashInfer have no torch-2.12/CUDA-13 wheel, so the Triton
+kernel here is implemented directly.)
 
 **Speculative decoding** is lossless and accepts ~50% of drafted tokens (~3.6 tokens per
 target step), but the wall-clock speedup is currently **below 1×**. Profiling shows why:
@@ -112,10 +111,10 @@ target step), but the wall-clock speedup is currently **below 1×**. Profiling s
 Verifying 5 tokens costs the same as decoding 1 — so the *idea* works perfectly, the target
 forward is pure launch overhead and amortizes for free. The problem is the draft: it's also
 ~20 ms of launch overhead (a 0.5B model is ~3 ms of actual compute), so the handful of draft
-steps cost more than the target call they save. The fix isn't a bigger target (I confirmed
-that with an int4 7B — same result); it's making the draft cheap with CUDA graphs. The graph
-machinery now exists for plain decode; wiring it into the draft loop is what flips this
-positive, and it's the next thing I'd do.
+steps cost more than the target call they save. The fix is not a bigger target (an int4 7B
+target gives the same result); it is making the draft cheap with CUDA graphs. The graph
+machinery already exists for plain decode; wiring it into the draft loop is what would flip
+this positive.
 
 **KV transfer** for disaggregation (Qwen2.5-7B KV geometry):
 
@@ -195,5 +194,5 @@ dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Graf
 tests/               34 tests
 ```
 
-This is a learning/portfolio project, not a production server — the goal was to build the
-real thing end to end and be able to explain every number above.
+This is a learning/portfolio project, not a production server — the aim is an end-to-end
+implementation where every number above is measured and accounted for.
