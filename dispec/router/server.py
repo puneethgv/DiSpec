@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from dispec.config import KVConfig
 from dispec.router import metrics
+from dispec.router.autoscale import DraftPoolAutoscaler
 from dispec.sampling import SamplingParams
 from dispec.sched.scheduler import ContinuousBatchingEngine
 
@@ -34,6 +35,7 @@ class InferenceServer:
         self.engine = ContinuousBatchingEngine(model, kv=kv, num_blocks=num_blocks,
                                                max_batch_tokens=max_batch_tokens)
         self.tok = tokenizer
+        self.autoscaler = DraftPoolAutoscaler()
         self._lock = threading.Lock()
         self._pending: dict[int, _Pending] = {}
         self._stop = False
@@ -47,14 +49,14 @@ class InferenceServer:
         self._thread.join(timeout=5)
 
     async def generate(self, prompt: str, max_new_tokens: int = 128,
-                       temperature: float = 0.0) -> dict:
+                       temperature: float = 0.0, priority: int = 0) -> dict:
         ids = self.tok(prompt).input_ids
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         with self._lock:
             rid = self.engine.add_request(ids, max_new_tokens,
                                           SamplingParams(temperature),
-                                          eos_id=self.tok.eos_token_id)
+                                          eos_id=self.tok.eos_token_id, priority=priority)
             self._pending[rid] = _Pending(loop, fut, time.perf_counter())
         out_ids = await fut
         return {"text": self.tok.decode(out_ids, skip_special_tokens=True),
@@ -76,6 +78,8 @@ class InferenceServer:
                     metrics.BATCH.observe(max(after - before, 1))
                     metrics.RUNNING.set(len(self.engine.running))
                     metrics.WAITING.set(len(self.engine.waiting))
+                    metrics.DRAFT_REPLICAS.set(
+                        self.autoscaler.observe(len(self.engine.running)))
                     self._reap()
             if idle:
                 time.sleep(0.003)

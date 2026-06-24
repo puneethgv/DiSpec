@@ -26,6 +26,7 @@ class GenerateRequest(BaseModel):
     prompt: str
     max_new_tokens: int = 128
     temperature: float = 0.0
+    priority: int = 0  # higher = scheduled sooner (SLO-aware routing)
 
 
 def create_app(model, tokenizer, **server_kwargs) -> FastAPI:
@@ -48,7 +49,8 @@ def create_app(model, tokenizer, **server_kwargs) -> FastAPI:
 
     @app.post("/generate")
     async def generate(req: GenerateRequest):
-        return await server.generate(req.prompt, req.max_new_tokens, req.temperature)
+        return await server.generate(req.prompt, req.max_new_tokens,
+                                     req.temperature, req.priority)
 
     @app.get("/metrics")
     async def get_metrics():

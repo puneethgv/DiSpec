@@ -31,5 +31,6 @@ STEP = Histogram(
 
 RUNNING = Gauge("dispec_running_requests", "Requests currently decoding")
 WAITING = Gauge("dispec_waiting_requests", "Requests waiting for admission")
+DRAFT_REPLICAS = Gauge("dispec_draft_replicas_desired", "Autoscaler's desired draft pool size")
 BATCH = Histogram("dispec_batch_tokens", "Tokens per forward step",
                   buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512))

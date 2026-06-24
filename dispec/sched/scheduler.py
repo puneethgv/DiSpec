@@ -42,6 +42,7 @@ class Request:
     state: State = State.WAITING
     cur_len: int = 0  # context length stored in cache
     prefilled: bool = False
+    priority: int = 0  # higher = admitted sooner (SLO-aware routing)
 
     @property
     def done(self) -> bool:
@@ -71,9 +72,10 @@ class ContinuousBatchingEngine:
         self.num_decode_tokens = 0
 
     def add_request(self, prompt_ids: list[int], max_new_tokens: int,
-                    params: SamplingParams | None = None, eos_id: int | None = None) -> int:
+                    params: SamplingParams | None = None, eos_id: int | None = None,
+                    priority: int = 0) -> int:
         req = Request(next(self._ids), list(prompt_ids), params or SamplingParams(),
-                      max_new_tokens, eos_id)
+                      max_new_tokens, eos_id, priority=priority)
         self.waiting.append(req)
         return req.id
 
@@ -112,7 +114,8 @@ class ContinuousBatchingEngine:
             budget -= 1
             self.num_decode_tokens += 1
 
-        # 2) Admit waiting requests (prefill) into the same forward if room.
+        # 2) Admit waiting requests (prefill), highest priority (then oldest) first.
+        self.waiting.sort(key=lambda r: (-r.priority, r.id))
         while self.waiting and budget >= len(self.waiting[0].prompt_ids):
             req = self.waiting[0]
             pl = len(req.prompt_ids)
