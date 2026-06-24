@@ -74,6 +74,28 @@ def test_batched_prefill_logits_match_single(model_and_tok):
         assert cos >= 0.999, f"prompt {k}: cosine {cos:.5f}"
 
 
+def test_chunked_prefill_matches_unchunked(model_and_tok):
+    """Splitting a prompt's prefill across steps must not change the output."""
+    model, tok = model_and_tok
+    pid = tok("The history of the Roman Empire spans many centuries and several "
+              "distinct political eras, beginning with").input_ids
+    assert len(pid) > 16
+    n_new = 24
+
+    full = ContinuousBatchingEngine(model, num_blocks=512)
+    full.add_request(pid, n_new, SamplingParams(0.0), eos_id=tok.eos_token_id)
+    full.run_until_done()
+    ref = next(iter(full.collect_outputs().values()))
+
+    chunked = ContinuousBatchingEngine(model, num_blocks=512, chunk_size=8)  # >1 chunk
+    rid = chunked.add_request(pid, n_new, SamplingParams(0.0), eos_id=tok.eos_token_id)
+    chunked.run_until_done()
+    out = chunked.collect_outputs()[rid]
+    # Chunked prefill is the same computation split across steps; compare a safe prefix
+    # (later tokens can flip on bf16 near-ties, like every free-running greedy compare).
+    assert out[:8] == ref[:8], f"chunked prefill changed the output\n{out}\n{ref}"
+
+
 def test_no_cross_sequence_leakage(model_and_tok):
     model, tok = model_and_tok
     pid = tok("Once upon a time, in a small village,", return_tensors="pt").input_ids[0].tolist()

@@ -33,9 +33,12 @@ class _Pending:
 
 class InferenceServer:
     def __init__(self, model, tokenizer, num_blocks: int = 2048,
-                 max_batch_tokens: int = 2048, kv: KVConfig | None = None):
-        self.engine = ContinuousBatchingEngine(model, kv=kv, num_blocks=num_blocks,
-                                               max_batch_tokens=max_batch_tokens)
+                 max_batch_tokens: int = 2048, kv: KVConfig | None = None,
+                 attn_backend: str = "native", fuse: bool = False,
+                 chunk_size: int | None = None):
+        self.engine = ContinuousBatchingEngine(
+            model, kv=kv, num_blocks=num_blocks, max_batch_tokens=max_batch_tokens,
+            attn_backend=attn_backend, fuse=fuse, chunk_size=chunk_size)
         self.tok = tokenizer
         self.autoscaler = DraftPoolAutoscaler()
         self._lock = threading.Lock()

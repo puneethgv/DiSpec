@@ -133,7 +133,8 @@ def main() -> None:
 
     from dispec.models.loader import load_target
     model, tok = load_target()
-    app = create_app(model, tok)
+    # Fast path: batched Triton attention + fused GEMMs.
+    app = create_app(model, tok, attn_backend="triton", fuse=True)
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 

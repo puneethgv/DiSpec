@@ -27,6 +27,7 @@ from dispec.sampling import SamplingParams, sample
 
 class State(Enum):
     WAITING = auto()
+    PREFILLING = auto()  # prompt partially prefilled (chunked prefill)
     RUNNING = auto()
     FINISHED = auto()
 
@@ -43,6 +44,7 @@ class Request:
     cur_len: int = 0  # context length stored in cache
     prefilled: bool = False
     priority: int = 0  # higher = admitted sooner (SLO-aware routing)
+    prefill_pos: int = 0  # prompt tokens prefilled so far (chunked prefill)
 
     @property
     def done(self) -> bool:
@@ -53,16 +55,21 @@ class Request:
 
 class ContinuousBatchingEngine:
     def __init__(self, model, kv: KVConfig | None = None, num_blocks: int = 2048,
-                 max_batch_tokens: int = 2048, attn_backend: str = "native", fuse: bool = False):
+                 max_batch_tokens: int = 2048, attn_backend: str = "native", fuse: bool = False,
+                 chunk_size: int | None = None):
         self.runner = ModelRunner(model, attn_backend=attn_backend, fuse=fuse)
         kv = kv or KVConfig()
         self.block_size = kv.block_size
         self.max_batch_tokens = max_batch_tokens
+        # Chunked prefill: cap prefill tokens processed per step so a long prompt
+        # co-batches with decodes instead of stalling them. Defaults to no chunking.
+        self.chunk_size = chunk_size or max_batch_tokens
         self.cache = PagedKVCache.for_model(
             model.config, num_blocks=num_blocks, block_size=kv.block_size,
             dtype=self.runner.dtype, device=str(self.runner.device),
         )
         self.waiting: list[Request] = []
+        self.prefilling: list[Request] = []
         self.running: list[Request] = []
         self.finished: list[Request] = []
         self._ids = itertools.count()
@@ -114,31 +121,49 @@ class ContinuousBatchingEngine:
             budget -= 1
             self.num_decode_tokens += 1
 
-        # 2) Admit waiting requests (prefill), highest priority (then oldest) first.
+        # 2) Prefill — continue in-progress chunked prefills, then admit new (highest
+        #    priority, then oldest). Each request advances at most chunk_size tokens this
+        #    step; only the chunk that *finishes* the prompt yields a token to sample.
+        sampled = [True] * len(batch)  # decode requests above all produce a token
         self.waiting.sort(key=lambda r: (-r.priority, r.id))
-        while self.waiting and budget >= len(self.waiting[0].prompt_ids):
-            req = self.waiting[0]
-            pl = len(req.prompt_ids)
-            try:
-                table = mgr.allocate(req.id, pl)
-            except OutOfBlocksError:
+        prefill_queue = self.prefilling + self.waiting
+        for req in prefill_queue:
+            if budget < 1:
                 break
-            self.waiting.pop(0)
-            slots = self.cache.context_slots(table.block_ids, pl).tolist()
-            token_ids.extend(req.prompt_ids)
-            positions.extend(range(pl))
+            pl = len(req.prompt_ids)
+            if req.state == State.WAITING:
+                try:
+                    table = mgr.allocate(req.id, pl)
+                except OutOfBlocksError:
+                    break
+                table.num_tokens = 0
+                req.state = State.PREFILLING
+                self.waiting.remove(req)
+                self.prefilling.append(req)
+            table = mgr.block_table(req.id)
+            chunk = min(pl - req.prefill_pos, self.chunk_size, budget)
+            pos = list(range(req.prefill_pos, req.prefill_pos + chunk))
+            slots = self.cache.slots_for_positions(
+                table.block_ids, torch.tensor(pos, device=dev)).tolist()
+            token_ids.extend(req.prompt_ids[req.prefill_pos:req.prefill_pos + chunk])
+            positions.extend(pos)
             write_slots.extend(slots)
-            seq_meta.append(SeqMeta(table.block_ids, pl, pl))
-            cursor += pl
-            last_idx.append(cursor - 1)
-            table.num_tokens = pl
-            req.cur_len = pl
-            req.prefilled = True
-            req.state = State.RUNNING
-            self.running.append(req)
+            seq_meta.append(SeqMeta(table.block_ids, chunk, req.prefill_pos + chunk))
+            cursor += chunk
+            req.prefill_pos += chunk
+            table.num_tokens = req.prefill_pos
+            budget -= chunk
+            self.num_prefill_tokens += chunk
             batch.append(req)
-            budget -= pl
-            self.num_prefill_tokens += pl
+            if req.prefill_pos >= pl:  # prompt fully prefilled -> sample first token
+                last_idx.append(cursor - 1)
+                sampled.append(True)
+                req.prefilled = True
+                req.state = State.RUNNING
+                self.prefilling.remove(req)
+                self.running.append(req)
+            else:
+                sampled.append(False)  # still prefilling, no token this step
 
         if not batch:
             return
@@ -150,17 +175,21 @@ class ContinuousBatchingEngine:
             torch.tensor(write_slots, device=dev, dtype=torch.long),
             seq_meta, self.cache,
         )
-        idx = torch.tensor(last_idx, device=dev)
-        logits = self.runner.logits(hidden[idx])  # (batch, vocab)
+        self.num_steps += 1
+        if not last_idx:  # all entries were mid-prefill chunks; nothing to sample
+            return
 
-        # 4) Sample one token per sequence (greedy path batches cleanly).
-        params0 = batch[0].params
-        next_ids = sample(logits, params0).tolist()
+        idx = torch.tensor(last_idx, device=dev)
+        logits = self.runner.logits(hidden[idx])  # (n_sampling, vocab)
+
+        # 4) Sample one token per request that produced one (decode + finished prefill).
+        sample_batch = [r for r, s in zip(batch, sampled) if s]
+        next_ids = sample(logits, sample_batch[0].params).tolist()
 
         # 5) Append outputs and retire finished. KV length is tracked by the block
         # table (updated on the next decode step), so we don't advance it here.
         finished = []
-        for req, tid in zip(batch, next_ids):
+        for req, tid in zip(sample_batch, next_ids):
             req.output_ids.append(int(tid))
             req.cur_len = mgr.block_table(req.id).num_tokens
             if req.done:
@@ -170,13 +199,12 @@ class ContinuousBatchingEngine:
             self.running.remove(req)
             self.finished.append(req)
             mgr.free(req.id)
-        self.num_steps += 1
 
     def collect_outputs(self) -> dict[int, list[int]]:
         return {r.id: r.output_ids for r in self.finished + self.running}
 
     def has_work(self) -> bool:
-        return bool(self.waiting or self.running)
+        return bool(self.waiting or self.prefilling or self.running)
 
     def run_until_done(self, max_steps: int = 100_000) -> None:
         steps = 0
