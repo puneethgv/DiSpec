@@ -40,6 +40,30 @@ def test_generate_and_metrics(client):
     assert "dispec_ttft_seconds" in metrics
 
 
+def test_openai_chat_completion(client):
+    r = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "Say hello in one word."}],
+        "max_tokens": 12})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["object"] == "chat.completion"
+    assert body["choices"][0]["message"]["role"] == "assistant"
+    assert body["choices"][0]["message"]["content"]
+
+
+def test_openai_chat_streaming(client):
+    chunks = []
+    with client.stream("POST", "/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Count: one two"}],
+            "max_tokens": 12, "stream": True}) as r:
+        assert r.status_code == 200
+        for line in r.iter_lines():
+            if line.startswith("data: ") and "[DONE]" not in line:
+                chunks.append(line)
+    assert chunks  # got streamed chunks
+    assert any('"delta"' in c for c in chunks)
+
+
 def test_concurrent_requests(client):
     # Several requests in flight exercise continuous batching through the server.
     import concurrent.futures as cf

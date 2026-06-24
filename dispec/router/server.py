@@ -27,6 +27,8 @@ class _Pending:
     future: asyncio.Future
     t_submit: float
     t_first: float = 0.0  # timestamp of first output token (0 = not yet)
+    queue: "asyncio.Queue | None" = None  # set for streaming requests
+    decoded: str = ""  # text streamed so far (for incremental delta decoding)
 
 
 class InferenceServer:
@@ -62,6 +64,23 @@ class InferenceServer:
         return {"text": self.tok.decode(out_ids, skip_special_tokens=True),
                 "num_tokens": len(out_ids)}
 
+    async def generate_stream(self, prompt: str, max_new_tokens: int = 128,
+                              temperature: float = 0.0, priority: int = 0):
+        """Yield text deltas as they're produced (for SSE streaming)."""
+        ids = self.tok(prompt).input_ids
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        with self._lock:
+            rid = self.engine.add_request(ids, max_new_tokens, SamplingParams(temperature),
+                                          eos_id=self.tok.eos_token_id, priority=priority)
+            self._pending[rid] = _Pending(loop, loop.create_future(),
+                                          time.perf_counter(), queue=q)
+        while True:
+            delta = await q.get()
+            if delta is None:  # end-of-stream sentinel
+                break
+            yield delta
+
     # -- background scheduler loop ------------------------------------------
     def _run(self) -> None:
         while not self._stop:
@@ -88,12 +107,15 @@ class InferenceServer:
         """Record TTFT and resolve futures for finished requests (holds the lock)."""
         now = time.perf_counter()
         by_id = {r.id: r for r in self.engine.running}
-        # TTFT: first output token observed while still running.
         for rid, p in self._pending.items():
             r = by_id.get(rid)
-            if r is not None and not p.t_first and r.output_ids:
+            if r is None or not r.output_ids:
+                continue
+            if not p.t_first:  # TTFT: first output token while still running
                 p.t_first = now
                 metrics.TTFT.observe(now - p.t_submit)
+            if p.queue is not None:  # streaming: push the new text delta
+                self._push_delta(p, r.output_ids)
         # Completion: drain engine.finished.
         if not self.engine.finished:
             return
@@ -107,5 +129,17 @@ class InferenceServer:
             metrics.TOKENS.inc(len(r.output_ids))
             if len(r.output_ids) > 1:
                 metrics.TPOT.observe((now - t_first) / (len(r.output_ids) - 1))
-            p.loop.call_soon_threadsafe(p.future.set_result, list(r.output_ids))
+            if p.queue is not None:
+                self._push_delta(p, r.output_ids)
+                p.loop.call_soon_threadsafe(p.queue.put_nowait, None)  # end sentinel
+            else:
+                p.loop.call_soon_threadsafe(p.future.set_result, list(r.output_ids))
         self.engine.finished = []
+
+    def _push_delta(self, p: _Pending, output_ids: list[int]) -> None:
+        """Decode the full output and push the newly-appeared text suffix to the queue."""
+        full = self.tok.decode(output_ids, skip_special_tokens=True)
+        if len(full) > len(p.decoded):
+            delta = full[len(p.decoded):]
+            p.decoded = full
+            p.loop.call_soon_threadsafe(p.queue.put_nowait, delta)

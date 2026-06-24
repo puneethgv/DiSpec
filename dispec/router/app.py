@@ -1,19 +1,24 @@
 """FastAPI serving layer for DiSpec.
 
 Endpoints:
-  POST /generate  {prompt, max_new_tokens, temperature} -> {text, num_tokens}
+  POST /generate              {prompt, max_new_tokens, temperature} -> {text, num_tokens}
+  POST /v1/chat/completions   OpenAI-compatible chat (streaming + non-streaming)
   GET  /health
-  GET  /metrics   Prometheus exposition (scrape target)
+  GET  /metrics               Prometheus exposition (scrape target)
+  GET  /dashboard             built-in live metrics page
 
 Run: python -m dispec.router.app   (loads the target model and serves on :8000)
 """
 
 from __future__ import annotations
 
+import json
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
@@ -27,6 +32,19 @@ class GenerateRequest(BaseModel):
     max_new_tokens: int = 128
     temperature: float = 0.0
     priority: int = 0  # higher = scheduled sooner (SLO-aware routing)
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    messages: list[ChatMessage]
+    model: str = "dispec"
+    max_tokens: int = 128
+    temperature: float = 0.0
+    stream: bool = False
 
 
 def create_app(model, tokenizer, **server_kwargs) -> FastAPI:
@@ -51,6 +69,37 @@ def create_app(model, tokenizer, **server_kwargs) -> FastAPI:
     async def generate(req: GenerateRequest):
         return await server.generate(req.prompt, req.max_new_tokens,
                                      req.temperature, req.priority)
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(req: ChatCompletionRequest):
+        """OpenAI-compatible chat completions (works with standard OpenAI clients)."""
+        msgs = [{"role": m.role, "content": m.content} for m in req.messages]
+        prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+
+        if req.stream:
+            async def event_stream():
+                async for delta in server.generate_stream(prompt, req.max_tokens, req.temperature):
+                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                             "model": req.model,
+                             "choices": [{"index": 0, "delta": {"content": delta},
+                                          "finish_reason": None}]}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                done = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                        "model": req.model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(done)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+        result = await server.generate(prompt, req.max_tokens, req.temperature)
+        return {
+            "id": cid, "object": "chat.completion", "created": created, "model": req.model,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": result["text"]}}],
+            "usage": {"completion_tokens": result["num_tokens"]},
+        }
 
     @app.get("/metrics")
     async def get_metrics():
