@@ -108,7 +108,8 @@ class ModelRunner:
         return cos[0].to(self.dtype), sin[0].to(self.dtype)
 
     # -- attention for one layer --------------------------------------------
-    def _attention(self, layer, x, cos, sin, write_slots, seq_meta, cache, layer_idx):
+    def _attention(self, layer, x, cos, sin, write_slots, seq_meta, cache, layer_idx,
+                   decode_batch=None):
         attn = layer.self_attn
         T = x.shape[0]
         if self.fused:
@@ -127,18 +128,11 @@ class ModelRunner:
 
         cache.write(layer_idx, write_slots, k, v)
 
-        # Fast path: one batched Triton kernel for an all-decode step (q_len==1 each),
-        # instead of a Python loop calling SDPA per sequence.
-        if self.attn_backend == "triton" and all(m.q_len == 1 for m in seq_meta):
+        # Fast path: one batched Triton kernel for an all-decode step (q_len==1 each).
+        # The slot table is identical across layers, so it's built once in forward().
+        if decode_batch is not None:
             from dispec.engine.triton_attn import batched_paged_decode_attention
-            B = len(seq_meta)
-            max_ctx = max(m.ctx_len for m in seq_meta)
-            slot_table = torch.zeros(B, max_ctx, dtype=torch.int32, device=self.device)
-            for i, meta in enumerate(seq_meta):
-                slot_table[i, :meta.ctx_len] = cache.context_slots(
-                    meta.block_ids, meta.ctx_len).to(torch.int32)
-            ctx_lens = torch.tensor([m.ctx_len for m in seq_meta],
-                                    dtype=torch.int32, device=self.device)
+            slot_table, ctx_lens = decode_batch
             o = batched_paged_decode_attention(
                 q, cache.key[layer_idx], cache.value[layer_idx],
                 slot_table, ctx_lens, self.kv_groups, self.scale)
@@ -187,9 +181,24 @@ class ModelRunner:
         """Returns normalized hidden states (T, hidden). Use `logits()` to project."""
         cos, sin = self.rope(positions)
         x = self.embed(token_ids)
+
+        # Build the batched-decode slot table once (it's identical across layers).
+        decode_batch = None
+        if self.attn_backend == "triton" and seq_meta and all(m.q_len == 1 for m in seq_meta):
+            B = len(seq_meta)
+            max_ctx = max(m.ctx_len for m in seq_meta)
+            slot_table = torch.zeros(B, max_ctx, dtype=torch.int32, device=self.device)
+            for i, meta in enumerate(seq_meta):
+                slot_table[i, :meta.ctx_len] = cache.context_slots(
+                    meta.block_ids, meta.ctx_len).to(torch.int32)
+            ctx_lens = torch.tensor([m.ctx_len for m in seq_meta],
+                                    dtype=torch.int32, device=self.device)
+            decode_batch = (slot_table, ctx_lens)
+
         for i, layer in enumerate(self.layers):
             h = layer.input_layernorm(x)
-            x = x + self._attention(layer, h, cos, sin, write_slots, seq_meta, cache, i)
+            x = x + self._attention(layer, h, cos, sin, write_slots, seq_meta, cache, i,
+                                    decode_batch)
             h = layer.post_attention_layernorm(x)
             x = x + self._mlp(layer, h, i)
         return self.norm(x)
