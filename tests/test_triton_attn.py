@@ -31,6 +31,35 @@ def test_kernel_matches_reference():
     assert (out - ref).abs().max().item() < 1e-2
 
 
+def test_batched_kernel_matches_reference():
+    import torch.nn.functional as F
+
+    from dispec.engine.triton_attn import batched_paged_decode_attention
+
+    torch.manual_seed(0)
+    B, H, KVH, D = 5, 12, 2, 128
+    groups = H // KVH
+    num_slots = 4096
+    q = torch.randn(B, H, D, device="cuda", dtype=torch.float16)
+    kc = torch.randn(num_slots, KVH, D, device="cuda", dtype=torch.float16)
+    vc = torch.randn(num_slots, KVH, D, device="cuda", dtype=torch.float16)
+    ctx_lens = torch.tensor([17, 64, 130, 200, 33], dtype=torch.int32, device="cuda")
+    max_ctx = int(ctx_lens.max())
+    slot_table = torch.zeros(B, max_ctx, dtype=torch.int32, device="cuda")
+    for i, c in enumerate(ctx_lens.tolist()):
+        slot_table[i, :c] = torch.randperm(num_slots, device="cuda")[:c].to(torch.int32)
+
+    out = batched_paged_decode_attention(q, kc, vc, slot_table, ctx_lens, groups).float()
+    scale = D ** -0.5
+    for i, c in enumerate(ctx_lens.tolist()):
+        s = slot_table[i, :c]
+        ki = kc[s].repeat_interleave(groups, dim=1).float().permute(1, 0, 2)
+        vi = vc[s].repeat_interleave(groups, dim=1).float().permute(1, 0, 2)
+        sc = (q[i].float()[:, None, :] * ki).sum(-1) * scale
+        ref = (sc.softmax(-1)[:, :, None] * vi).sum(1)
+        assert F.cosine_similarity(out[i].flatten(), ref.flatten(), dim=0).item() > 0.999
+
+
 def test_triton_backend_matches_native_logits():
     """Per-step logits cosine between the triton and native decode paths (robust to the
     bf16 near-tie flips that make free-running greedy comparisons flaky)."""

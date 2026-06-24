@@ -127,21 +127,28 @@ class ModelRunner:
 
         cache.write(layer_idx, write_slots, k, v)
 
+        # Fast path: one batched Triton kernel for an all-decode step (q_len==1 each),
+        # instead of a Python loop calling SDPA per sequence.
+        if self.attn_backend == "triton" and all(m.q_len == 1 for m in seq_meta):
+            from dispec.engine.triton_attn import batched_paged_decode_attention
+            B = len(seq_meta)
+            max_ctx = max(m.ctx_len for m in seq_meta)
+            slot_table = torch.zeros(B, max_ctx, dtype=torch.int32, device=self.device)
+            for i, meta in enumerate(seq_meta):
+                slot_table[i, :meta.ctx_len] = cache.context_slots(
+                    meta.block_ids, meta.ctx_len).to(torch.int32)
+            ctx_lens = torch.tensor([m.ctx_len for m in seq_meta],
+                                    dtype=torch.int32, device=self.device)
+            o = batched_paged_decode_attention(
+                q, cache.key[layer_idx], cache.value[layer_idx],
+                slot_table, ctx_lens, self.kv_groups, self.scale)
+            return attn.o_proj(o.reshape(T, self.num_heads * self.head_dim))
+
         out = torch.empty_like(q)
         offset = 0
         for meta in seq_meta:
             qi = q[offset:offset + meta.q_len]  # (q_len, H, D)
             ctx_slots = cache.context_slots(meta.block_ids, meta.ctx_len)
-
-            # Fast path: fused Triton paged attention for single-token decode.
-            if self.attn_backend == "triton" and meta.q_len == 1:
-                from dispec.engine.triton_attn import paged_decode_attention
-                out[offset] = paged_decode_attention(
-                    qi[0], cache.key[layer_idx], cache.value[layer_idx],
-                    ctx_slots, self.kv_groups, self.scale)
-                offset += 1
-                continue
-
             ki, vi = cache.gather(layer_idx, ctx_slots)  # (ctx_len, KVH, D)
 
             # GQA: expand kv heads to query heads.
