@@ -1,182 +1,192 @@
 # DiSpec — a from-scratch LLM inference engine
 
-A complete LLM serving stack built from scratch on a single 8 GB GPU: **paged KV cache,
-continuous-batching scheduler, a custom model forward pass, CUDA-graph decode, speculative
-decoding, prefill/decode (P/D) disaggregation, and a FastAPI server with Prometheus/Grafana
-observability.** Everything around the matmuls is implemented by hand — it is **not** built
-on vLLM/TGI; those are used only as reference baselines.
+DiSpec is an LLM serving engine I wrote from scratch to understand how systems like vLLM
+actually work — by building the pieces myself rather than calling them. It runs real models
+(Qwen2.5) on a single 8 GB laptop GPU and implements the whole path: a paged KV cache, a
+continuous-batching scheduler, the model forward pass, CUDA-graph decode, speculative
+decoding, prefill/decode disaggregation with KV transfer, and an HTTP server with metrics.
 
-The two levers in the name are real features of the engine:
-- **Speculative decoding** — a small draft proposes tokens the target verifies in one pass,
-  fighting the memory-bandwidth wall in decode (provably lossless).
-- **P/D disaggregation** — run prefill and decode on separate workers with KV transfer, so
-  the two (compute-bound vs bandwidth-bound) stop fighting over one GPU and wrecking SLOs.
+The only thing I lean on PyTorch/HuggingFace for is the raw matmuls (and the pretrained
+weights). Everything around them — cache layout, attention masking, scheduling, sampling,
+the speculative-decoding math, cross-process KV movement — is hand-written. vLLM and
+HuggingFace `generate` show up only as baselines to measure against.
 
-But the stack is broader than its name: the biggest measured wins here come from
-**continuous batching** (~1.7×) and **CUDA-graph decode** (3.6× on the decode step), and the
-project is really an end-to-end inference engine you can read top to bottom.
+The name comes from two of the features (**Di**saggregation + **Spec**ulative decoding), but
+honestly the engine is broader than that, and the biggest speedups come from the less
+glamorous parts: continuous batching and CUDA graphs.
 
-## Why this matters
+## Why these techniques exist
 
-- **Decode is memory-bandwidth-bound.** Generating one token streams the entire model from
-  HBM, so the big target GPU is idle. Speculative decoding lets a small draft model propose
-  many tokens that the target verifies in a single forward pass — provably preserving the
-  target's output distribution.
-- **Prefill and decode interfere.** Prefill is compute-bound and bursty; decode is
-  bandwidth-bound and steady. Co-locating them hurts tail latency. Disaggregation runs them
-  on separate workers and transfers the KV cache between them.
+Two facts drive almost everything in LLM serving:
 
-## What works today (Phases 0–1)
+- **Decode is memory-bandwidth-bound.** Generating one token reads the entire model out of
+  HBM, so a big GPU sits mostly idle during decode. *Speculative decoding* hides this: a
+  small draft model guesses several tokens and the big model verifies them in a single
+  forward pass — provably without changing the output distribution.
+- **Prefill and decode want different things.** Prefill is compute-heavy and bursty; decode
+  is bandwidth-heavy and steady. Run them on the same GPU and they hurt each other's
+  latency. *P/D disaggregation* splits them onto separate workers and ships the KV cache
+  between them.
 
-- **Paged KV cache** with a block allocator and copy-on-write forking (`dispec/kv/`).
-- **From-scratch Qwen2 forward** over the paged cache: own rotary embeddings, GQA, and a
-  right-aligned causal paged attention (`dispec/engine/model_runner.py`). Validated to match
-  HuggingFace logits (per-position cosine ≈ 0.99995, identical argmax).
-- **Continuous batching** scheduler: iteration-level scheduling that mixes prefill and decode
-  tokens in one forward pass, token-budgeted, with no cross-sequence leakage
-  (`dispec/sched/scheduler.py`).
-- **Benchmarks** vs a HuggingFace baseline (`bench/`).
+DiSpec implements both, plus the machinery they need to be useful (paging, batching, a
+scheduler, a server).
 
-### Phase-1 results (Qwen2.5-1.5B, RTX 3070 Laptop 8 GB, bf16)
+## What's in it
 
-| Config | Throughput | vs HF |
+- **Paged KV cache** (`dispec/kv/`) — a block allocator with copy-on-write forking and a
+  GPU block pool, so variable-length sequences share memory without padding waste.
+- **From-scratch Qwen2 forward** (`dispec/engine/model_runner.py`) — my own rotary
+  embeddings, grouped-query attention, and right-aligned causal masking over the paged
+  cache. Verified against HuggingFace at the logits level (per-position cosine ≈ 0.99995,
+  same argmax).
+- **Continuous batching** (`dispec/sched/scheduler.py`) — iteration-level scheduling that
+  mixes prefill and decode tokens in one forward pass, bounded by a token budget, with
+  priority-aware admission. No cross-sequence leakage (tested).
+- **CUDA-graph decode** (`dispec/engine/cuda_graph.py`) — captures the decode step as a
+  replayable graph to kill per-layer launch overhead. This is the single biggest win.
+- **Speculative decoding** (`dispec/spec/`) — independent 0.5B draft + rejection sampling,
+  lossless (the acceptance math is unit-tested to reproduce the target distribution).
+- **P/D disaggregation** (`dispec/transport/`, `dispec/workers/`) — prefill and decode as
+  separate processes with a pluggable KV transport: zero-copy CUDA IPC on one node, TCP for
+  multi-node.
+- **Serving + observability** (`dispec/router/`) — a FastAPI server, Prometheus `/metrics`,
+  a built-in live `/dashboard`, an optional Grafana stack, SLO priority routing, and a
+  draft-pool autoscaler.
+
+25 tests cover all of it (cache, forward correctness, batching, rejection math, spec
+decoding, transports, disaggregation, CUDA graphs, the HTTP server, the autoscaler).
+
+## Numbers
+
+All on Qwen2.5-1.5B, RTX 3070 Laptop (8 GB), bf16, greedy.
+
+**Throughput** — each row adds one technique:
+
+| Config | tok/s | vs HF |
 |---|---|---|
-| HuggingFace baseline (single-stream) | 51 tok/s | 1.0× |
-| DiSpec single-sequence (eager) | 40 tok/s | 0.78× |
-| DiSpec single-seq + **CUDA graph** | 68 tok/s | 1.32× |
-| **DiSpec continuous batching** | **~86 tok/s** | **1.66×** |
+| HuggingFace `generate` (single stream) | 51 | 1.0× |
+| DiSpec single-sequence, eager | 40 | 0.78× |
+| DiSpec single-sequence + CUDA graph | 68 | 1.32× |
+| DiSpec continuous batching | 86 | 1.66× |
+| *vLLM (reference)* | *528* | *10×* |
 
-Eager throughput is launch-bound (per-layer Python loop). **CUDA-graph capture of the
-decode step** removes that overhead — replaying the forward as one launch makes single-seq
-decode 3.6× faster on 0.5B / 1.7× on 1.5B, enough to beat the HF baseline
-(`LLMEngine(cuda_graph=True)`; bucketed by context length, output matches eager at the
-logits level). Liger kernels were tried and were *slower* for batch-1 decode — they target
-training-size shapes, not single-token decode.
+The eager engine is slower than HF single-stream — no surprise, it's a Python loop over 28
+layers and the launch overhead dominates. CUDA graphs fix that: capturing the decode step
+makes it 3.6× faster on the 0.5B and 1.7× on the 1.5B, enough to pass HF. Continuous
+batching is the throughput lever.
 
-**vLLM reference:** on the same model/prompts, vLLM does ~528 tok/s — ~6× DiSpec's
-continuous batching. That gap *is* the value of optimized kernels (PagedAttention/Triton),
-CUDA graphs, and a tuned scheduler — exactly the Phase-5 roadmap. DiSpec implements the same
-*architecture* from scratch and is correct; closing the constant-factor gap is the remaining
-engineering. (Run `bench/vllm_ref.py` in an isolated venv; vLLM ships its own torch.)
+vLLM is ~6× faster than my continuous batching, and that gap is the honest one: it's
+optimized CUDA/Triton kernels, CUDA graphs everywhere, and years of scheduler tuning. DiSpec
+has the same *architecture* and is correct — closing the constant factor is the remaining
+work, not a redesign. (I also tried Liger kernels; they were *slower* for single-token
+decode because they're tuned for training-size shapes.)
 
-### Phase-2 results — speculative decoding (lossless)
+**Speculative decoding** is the interesting disappointment. It's lossless and accepts ~50%
+of drafted tokens (~3.6 tokens per target step), but the wall-clock speedup is currently
+**below 1×**. Profiling says exactly why:
 
-Sequential speculative decoding with a 0.5B draft + rejection sampling
-(`dispec/spec/`). The acceptance math is unit-tested to reproduce the target
-distribution; on real models it is lossless in practice (greedy output matches
-target-only) at **~50% acceptance, ~3.6 tokens per target iteration**.
-
-Wall-clock speedup, however, is currently **<1×** — and profiling shows exactly why,
-which is the interesting part:
-
-| Forward (7B-int4 target / 0.5B draft) | Time |
+| Forward (7B-int4 target / 0.5B draft) | time |
 |---|---|
-| Target decode, 1 token | 31.9 ms |
-| **Target verify, 5 tokens** | **32.0 ms** (≈ same as 1) |
-| Draft decode, 1 token | 20.2 ms |
+| target decode, 1 token | 31.9 ms |
+| target verify, 5 tokens | 32.0 ms |
+| draft decode, 1 token | 20.2 ms |
 
-The target forward is **launch-bound**: verifying 5 tokens costs the same as decoding
-1, so speculation's core mechanism — amortizing the target — works perfectly. But the
-*draft* forward also carries ~20 ms of Python/launch overhead (a 0.5B model is only
-~3 ms of real compute), so the K≈5 draft steps cost more than the target call they
-save. **Speculation here is bottlenecked by per-forward overhead, not target size** —
-the fix is CUDA graphs / `torch.compile`d forwards to make the draft cheap, not a
-bigger model. (int4 7B was tried specifically to test the "bigger target" hypothesis;
-the profile above is why it didn't help. `torch.compile(mode="reduce-overhead")` was
-also tried but inductor rejects the forward as written. The unlock — **hand-written
-CUDA-graph capture of the decode step — is now implemented** (see Phase-1 results, 3.6×
-on 0.5B decode); wiring it into the speculative draft loop to flip the wall-clock result
-is the remaining integration.)
+Verifying 5 tokens costs the same as decoding 1 — so the *idea* works perfectly, the target
+forward is pure launch overhead and amortizes for free. The problem is the draft: it's also
+~20 ms of launch overhead (a 0.5B model is ~3 ms of actual compute), so the handful of draft
+steps cost more than the target call they save. The fix isn't a bigger target (I confirmed
+that with an int4 7B — same result); it's making the draft cheap with CUDA graphs. The graph
+machinery now exists for plain decode; wiring it into the draft loop is what flips this
+positive, and it's the next thing I'd do.
 
-### Phase-3 results — true P/D disaggregation
+**KV transfer** for disaggregation (Qwen2.5-7B KV geometry):
 
-Prefill and decode run as **separate processes** wired by a pluggable KV-transfer
-engine (`dispec/transport/`, `dispec/workers/`). The decode worker generates from KV
-computed by the prefill worker and shipped over the transport; output is
-**token-for-token identical** to the colocated baseline (verified in tests).
-
-KV-transfer cost (Qwen2.5-7B geometry, RTX 3070):
-
-| prompt len | KV size | TCP transfer | TCP throughput |
+| prompt length | KV size | TCP transfer | throughput |
 |---|---|---|---|
 | 512 | 29 MB | 99 ms | 0.30 GB/s |
 | 2048 | 117 MB | 350 ms | 0.34 GB/s |
 
-`TcpTransport` (the multi-node fallback) is serialize+copy bound and scales linearly;
-`CudaIpcTransport` hands off the same KV by sharing the GPU buffer's IPC handle —
-zero-copy, O(1) in payload size. This is the concrete argument for on-node IPC/NVLink
-and for an RDMA/NIXL backend over the wire.
+TCP is serialize-and-copy bound and scales with payload size — it's the multi-node fallback.
+CUDA IPC moves the same KV by passing the GPU buffer's handle: zero-copy, constant time. The
+disaggregated output is token-for-token identical to running it all on one process (tested),
+which is the thing that actually has to be true.
 
-## Roadmap
+## How it fits together
 
-- **Phase 2 (done, analyzed)** — lossless speculative decoding; wall-clock speedup
-  pending overhead reduction (CUDA graphs / compiled forwards), see above.
-- **Phase 3 (done)** — true P/D disaggregation across processes with a pluggable
-  KV-transfer engine (CUDA IPC zero-copy on-node, TCP multi-node); output matches
-  colocated. Remaining: SLO-aware router + draft-pool autoscaling.
-- **Phase 4 (in progress)** — FastAPI serving layer + Prometheus/Grafana observability
-  + Poisson load testing (done); ablations + vLLM comparison (todo).
-- **Phase 5 (started)** — CUDA-graph decode capture (done: 3.6× on 0.5B, beats HF on
-  1.5B). Next: batched CUDA graphs for continuous batching, graph-accelerated spec draft
-  loop, Triton paged/tree-attention kernels, EAGLE draft head, int4.
+```
+            client ──► FastAPI router ──► scheduler (continuous batching, priority)
+                          /metrics            │
+                          /dashboard          ▼
+                                        model runner ──► paged KV cache
+                                          (CUDA graph)        │
+                                                              │ export/import
+       disaggregated mode:  prefill worker ──KV transport──► decode worker
+                                              (CUDA IPC / TCP)
 
-### Serving layer + observability (Phase 4)
+       speculative mode:    draft model ──proposes──► target model verifies (rejection sampling)
+```
 
-A FastAPI server runs the continuous-batching engine on a background scheduler thread
-(`dispec/router/`): async `/generate` handlers submit requests and await futures the
-scheduler resolves on completion. `bench/load_gen.py` drives it with Poisson arrivals
-and reports latency percentiles + goodput (e.g. 32 reqs @ 8/s → 76 tok/s goodput, with
-queueing latency under overload as expected).
-
-**Viewing metrics — two ways:**
-
-1. **Built-in (zero infra):** open `http://localhost:8000/dashboard` — a live page
-   (throughput, queue depth, TTFT/TPOT) backed by `/stats`. Nothing else to install.
-2. **Full Prometheus + Grafana:** the dashboard JSON in `dashboards/` only renders
-   inside Grafana. Bring the stack up with Docker:
-   ```bash
-   python -m dispec.router.app          # server on :8000 (host, uses the GPU)
-   docker compose up -d                 # Prometheus :9090 + Grafana :3000
-   # open http://localhost:3000 -> "DiSpec Inference Server" (auto-provisioned)
-   ```
-   `/metrics` exposes TTFT, TPOT, E2E latency, throughput, queue depth, and batch size.
-
-## Setup
+## Running it
 
 ```bash
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
-.venv/bin/python -m dispec.env_check          # validate GPU / bf16 / triton
-.venv/bin/python -m pytest -q                  # run tests
+
+.venv/bin/python -m dispec.env_check     # check GPU / bf16 / triton
+.venv/bin/python -m pytest -q            # 25 tests
 
 # benchmarks
-.venv/bin/python -m bench.baseline_hf          # HF baseline
-.venv/bin/python -m bench.dispec_bench         # engine: single-seq vs continuous batching
-.venv/bin/python -m bench.spec_bench           # speculative decoding (add --gptq for int4 7B)
-.venv/bin/python -m bench.disagg_bench         # KV-transfer latency
+.venv/bin/python -m bench.ablations      # the throughput table above
+.venv/bin/python -m bench.spec_bench     # speculative decoding (--gptq for the int4 7B target)
+.venv/bin/python -m bench.disagg_bench   # KV-transfer cost
 
-# serve + load test
-.venv/bin/python -m dispec.router.app          # FastAPI server on :8000 (/generate /metrics)
-.venv/bin/python -m bench.load_gen --rate 8 --n 64
+# serve it
+.venv/bin/python -m dispec.router.app    # http://localhost:8000  (/generate, /metrics, /dashboard)
+.venv/bin/python -m bench.load_gen --rate 8 --n 64   # Poisson load
 ```
 
-int4 GPTQ target needs the `quant` extra (`pip install -e ".[quant]"`) and `ninja` on PATH.
+For metrics you have two options: open `http://localhost:8000/dashboard` for a built-in live
+page (no extra setup), or run `docker compose up -d` to get Prometheus + Grafana with the
+dashboard in `dashboards/` auto-loaded.
+
+The int4 GPTQ target (`bench.spec_bench --gptq`) needs the `quant` extra
+(`uv pip install -e ".[quant]"`) and `ninja` on `PATH` for the Marlin kernels. vLLM, if you
+want to reproduce the reference number, goes in a separate venv (`bench/vllm_ref.py`) since it
+ships its own torch.
 
 ## Layout
 
 ```
 dispec/
-  config.py            model choices + generation/KV/spec configs
-  sampling.py          greedy / top-k / top-p, built for spec-decode rejection math
-  env_check.py         GPU / bf16 / triton validation
-  kv/                  block_manager.py (paged allocator + COW), paged_cache.py (GPU pool)
-  engine/              model_runner.py (from-scratch Qwen2 fwd), engine.py (single-seq)
-  sched/               scheduler.py (continuous batching)
-  spec/                rejection.py (lossless verify), speculative.py (draft+target)
-  transport/           base/tcp/cuda_ipc — pluggable KV-transfer engine
-  workers/             disaggregated.py — prefill/decode worker processes
-  router/              app.py (FastAPI), server.py (scheduler thread), metrics.py
-bench/                 baseline_hf, dispec_bench, spec_bench, disagg_bench, load_gen
-dashboards/            dispec.json (Grafana)
-tests/                 17+ tests: cache, runner, scheduler, rejection, spec, transport, disagg, server
+  config.py          models + generation/KV/spec config
+  sampling.py        greedy / top-k / top-p, written for the rejection-sampling math
+  env_check.py       GPU / bf16 / triton check
+  kv/                block_manager.py (paged allocator + COW), paged_cache.py (GPU pool)
+  engine/            model_runner.py (Qwen2 forward), engine.py (single-seq), cuda_graph.py
+  sched/             scheduler.py (continuous batching + priority admission)
+  spec/              rejection.py (lossless verify), speculative.py (draft + target)
+  transport/         base / cuda_ipc / tcp — the KV-transfer engine
+  workers/           disaggregated.py — prefill & decode worker processes
+  router/            app.py (FastAPI), server.py (scheduler thread), metrics.py,
+                     dashboard.py (built-in UI), autoscale.py (draft-pool controller)
+bench/               ablations, baseline_hf, dispec_bench, spec_bench, disagg_bench,
+                     load_gen, vllm_ref
+dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Grafana config
+tests/               25 tests
 ```
+
+## What's left
+
+Roughly in the order I'd do it:
+
+1. **Graph-accelerate the speculative draft loop** — the one change that flips speculative
+   decoding to a real wall-clock win.
+2. **Batched CUDA graphs** for continuous batching — pushes server throughput toward vLLM.
+3. **Triton kernels** — a real paged-attention kernel (and tree-attention for tree
+   speculation), which is where most of the remaining gap to vLLM lives.
+4. **EAGLE draft head** — to push acceptance from ~50% toward 80%+.
+5. **int4 everywhere** — fit a larger target and free up KV memory.
+
+This is a learning/portfolio project, not a production server — the goal was to build the
+real thing end to end and be able to explain every number above, including the ones that
+didn't go my way.
