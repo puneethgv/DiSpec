@@ -2,9 +2,10 @@
 
 DiSpec is an LLM serving engine I wrote from scratch to understand how systems like vLLM
 actually work — by building the pieces myself rather than calling them. It runs real models
-(Qwen2.5) on a single 8 GB laptop GPU and implements the whole path: a paged KV cache, a
-continuous-batching scheduler, the model forward pass, CUDA-graph decode, speculative
-decoding, prefill/decode disaggregation with KV transfer, and an HTTP server with metrics.
+(Qwen2.5) on a single 8 GB laptop GPU and implements the whole path: a paged KV cache with
+prefix sharing, a continuous-batching scheduler, the model forward pass, CUDA-graph decode,
+speculative decoding, prefill/decode disaggregation with KV transfer, and an
+OpenAI-compatible HTTP server with metrics.
 
 The only thing I lean on PyTorch/HuggingFace for is the raw matmuls (and the pretrained
 weights). Everything around them — cache layout, attention masking, scheduling, sampling,
@@ -35,6 +36,9 @@ scheduler, a server).
 
 - **Paged KV cache** (`dispec/kv/`) — a block allocator with copy-on-write forking and a
   GPU block pool, so variable-length sequences share memory without padding waste.
+- **Prefix caching** (`dispec/kv/prefix_cache.py`) — requests that share a leading prefix
+  (system prompt, few-shot preamble, chat history) reuse cached KV blocks instead of
+  re-prefilling them, with LRU eviction under memory pressure.
 - **From-scratch Qwen2 forward** (`dispec/engine/model_runner.py`) — my own rotary
   embeddings, grouped-query attention, and right-aligned causal masking over the paged
   cache. Verified against HuggingFace at the logits level (per-position cosine ≈ 0.99995,
@@ -49,12 +53,14 @@ scheduler, a server).
 - **P/D disaggregation** (`dispec/transport/`, `dispec/workers/`) — prefill and decode as
   separate processes with a pluggable KV transport: zero-copy CUDA IPC on one node, TCP for
   multi-node.
-- **Serving + observability** (`dispec/router/`) — a FastAPI server, Prometheus `/metrics`,
-  a built-in live `/dashboard`, an optional Grafana stack, SLO priority routing, and a
-  draft-pool autoscaler.
+- **Serving + observability** (`dispec/router/`) — a FastAPI server with an
+  OpenAI-compatible `/v1/chat/completions` endpoint (streaming + non-streaming), Prometheus
+  `/metrics`, a built-in live `/dashboard`, an optional Grafana stack, SLO priority routing,
+  and a draft-pool autoscaler.
 
-25 tests cover all of it (cache, forward correctness, batching, rejection math, spec
-decoding, transports, disaggregation, CUDA graphs, the HTTP server, the autoscaler).
+30 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
+math, spec decoding, transports, disaggregation, CUDA graphs, the HTTP server, the
+autoscaler).
 
 ## Numbers
 
@@ -160,7 +166,8 @@ dispec/
   config.py          models + generation/KV/spec config
   sampling.py        greedy / top-k / top-p, written for the rejection-sampling math
   env_check.py       GPU / bf16 / triton check
-  kv/                block_manager.py (paged allocator + COW), paged_cache.py (GPU pool)
+  kv/                block_manager.py (paged allocator + COW), paged_cache.py (GPU pool),
+                     prefix_cache.py (shared-prefix KV reuse)
   engine/            model_runner.py (Qwen2 forward), engine.py (single-seq), cuda_graph.py
   sched/             scheduler.py (continuous batching + priority admission)
   spec/              rejection.py (lossless verify), speculative.py (draft + target)
@@ -171,7 +178,7 @@ dispec/
 bench/               ablations, baseline_hf, dispec_bench, spec_bench, disagg_bench,
                      load_gen, vllm_ref
 dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Grafana config
-tests/               25 tests
+tests/               30 tests
 ```
 
 This is a learning/portfolio project, not a production server — the goal was to build the
