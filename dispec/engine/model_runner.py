@@ -42,8 +42,10 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 class ModelRunner:
-    def __init__(self, model):
+    def __init__(self, model, attn_backend: str = "native"):
+        # attn_backend: "native" (PyTorch SDPA) or "triton" (fused paged kernel for decode).
         self.model = model
+        self.attn_backend = attn_backend
         cfg = model.config
         self.cfg = cfg
         self.device = next(model.parameters()).device
@@ -94,6 +96,16 @@ class ModelRunner:
         for meta in seq_meta:
             qi = q[offset:offset + meta.q_len]  # (q_len, H, D)
             ctx_slots = cache.context_slots(meta.block_ids, meta.ctx_len)
+
+            # Fast path: fused Triton paged attention for single-token decode.
+            if self.attn_backend == "triton" and meta.q_len == 1:
+                from dispec.engine.triton_attn import paged_decode_attention
+                out[offset] = paged_decode_attention(
+                    qi[0], cache.key[layer_idx], cache.value[layer_idx],
+                    ctx_slots, self.kv_groups, self.scale)
+                offset += 1
+                continue
+
             ki, vi = cache.gather(layer_idx, ctx_slots)  # (ctx_len, KVH, D)
 
             # GQA: expand kv heads to query heads.
