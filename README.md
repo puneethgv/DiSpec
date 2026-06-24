@@ -1,14 +1,20 @@
-# DiSpec — Disaggregated Speculative Decoding (from scratch)
+# DiSpec — a from-scratch LLM inference engine
 
-A from-scratch LLM inference engine that unifies the two biggest levers in modern
-serving: **speculative decoding** (to fight the memory-bandwidth wall in decode) and
-**prefill/decode disaggregation** (to stop prefill and decode from fighting over the
-same GPU and wrecking latency SLOs).
+A complete LLM serving stack built from scratch on a single 8 GB GPU: **paged KV cache,
+continuous-batching scheduler, a custom model forward pass, CUDA-graph decode, speculative
+decoding, prefill/decode (P/D) disaggregation, and a FastAPI server with Prometheus/Grafana
+observability.** Everything around the matmuls is implemented by hand — it is **not** built
+on vLLM/TGI; those are used only as reference baselines.
 
-The whole serving stack is implemented from scratch — paged KV cache, continuous-batching
-scheduler, the model forward pass, speculative decoding, and (later) cross-process KV
-transfer — using PyTorch + HuggingFace *weight modules* only for the raw matmuls. It is
-**not** built on vLLM/TGI; those are used only as reference baselines.
+The two levers in the name are real features of the engine:
+- **Speculative decoding** — a small draft proposes tokens the target verifies in one pass,
+  fighting the memory-bandwidth wall in decode (provably lossless).
+- **P/D disaggregation** — run prefill and decode on separate workers with KV transfer, so
+  the two (compute-bound vs bandwidth-bound) stop fighting over one GPU and wrecking SLOs.
+
+But the stack is broader than its name: the biggest measured wins here come from
+**continuous batching** (~1.7×) and **CUDA-graph decode** (3.6× on the decode step), and the
+project is really an end-to-end inference engine you can read top to bottom.
 
 ## Why this matters
 

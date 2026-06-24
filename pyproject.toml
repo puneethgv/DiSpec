@@ -1,7 +1,7 @@
 [project]
 name = "dispec"
 version = "0.1.0"
-description = "DiSpec: a from-scratch disaggregated speculative-decoding LLM inference engine"
+description = "DiSpec: a from-scratch LLM inference engine — paged attention, continuous batching, CUDA graphs, speculative decoding, and prefill/decode disaggregation"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.4",
