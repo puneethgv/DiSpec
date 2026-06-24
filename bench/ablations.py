@@ -42,8 +42,9 @@ def hf_single(model, tok, prompts, max_new):
     return statistics.mean(tps), None
 
 
-def dispec_single(model, tok, prompts, max_new):
-    eng = LLMEngine(model, num_blocks=2048)
+def dispec_single(model, tok, prompts, max_new, cuda_graph=False):
+    eng = LLMEngine(model, num_blocks=2048, cuda_graph=cuda_graph,
+                    graph_buckets=(512, 2048) if cuda_graph else (256,))
     params = SamplingParams(0.0)
     eng.generate(tok(prompts[0]).input_ids, 8, params, eos_token_id=tok.eos_token_id)
     tps = []
@@ -107,6 +108,8 @@ def main() -> None:
     rows.append(("HF baseline (single stream)", base, "")); free()
     s, _ = dispec_single(target, tok, prompts, args.max_new)
     rows.append(("DiSpec single-sequence", s, "")); free()
+    sg, _ = dispec_single(target, tok, prompts, args.max_new, cuda_graph=True)
+    rows.append(("DiSpec single-seq + CUDA graph", sg, "")); free()
     cb, _ = dispec_cb(target, tok, prompts, args.max_new, args.concurrency)
     rows.append((f"DiSpec continuous batching (c={args.concurrency})", cb, "")); free()
     sp, acc = dispec_spec(target, draft, tok, prompts, args.max_new, args.k)

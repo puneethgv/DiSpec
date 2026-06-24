@@ -33,15 +33,19 @@ transfer — using PyTorch + HuggingFace *weight modules* only for the raw matmu
 
 ### Phase-1 results (Qwen2.5-1.5B, RTX 3070 Laptop 8 GB, bf16)
 
-| Config | Throughput |
-|---|---|
-| HuggingFace baseline (single-stream) | 54.9 tok/s |
-| DiSpec single-sequence | 41.0 tok/s |
-| **DiSpec continuous batching** | **~92 tok/s (≈1.7×)** |
+| Config | Throughput | vs HF |
+|---|---|---|
+| HuggingFace baseline (single-stream) | 51 tok/s | 1.0× |
+| DiSpec single-sequence (eager) | 40 tok/s | 0.78× |
+| DiSpec single-seq + **CUDA graph** | 68 tok/s | 1.32× |
+| **DiSpec continuous batching** | **~86 tok/s** | **1.66×** |
 
-Throughput plateaus because the per-sequence Python attention loop is CPU-bound — motivating
-a fused Triton paged-attention kernel (planned). Correctness, not single-stream speed, is the
-Phase-1 goal.
+Eager throughput is launch-bound (per-layer Python loop). **CUDA-graph capture of the
+decode step** removes that overhead — replaying the forward as one launch makes single-seq
+decode 3.6× faster on 0.5B / 1.7× on 1.5B, enough to beat the HF baseline
+(`LLMEngine(cuda_graph=True)`; bucketed by context length, output matches eager at the
+logits level). Liger kernels were tried and were *slower* for batch-1 decode — they target
+training-size shapes, not single-token decode.
 
 **vLLM reference:** on the same model/prompts, vLLM does ~528 tok/s — ~6× DiSpec's
 continuous batching. That gap *is* the value of optimized kernels (PagedAttention/Triton),
@@ -73,9 +77,10 @@ save. **Speculation here is bottlenecked by per-forward overhead, not target siz
 the fix is CUDA graphs / `torch.compile`d forwards to make the draft cheap, not a
 bigger model. (int4 7B was tried specifically to test the "bigger target" hypothesis;
 the profile above is why it didn't help. `torch.compile(mode="reduce-overhead")` was
-also tried but inductor rejects the forward as written — the HF rotary module call +
-inference-mode tensors break it; the clean unlock is CUDA-graph bucketing of the
-fixed-shape decode step, scoped as Phase 5.)
+also tried but inductor rejects the forward as written. The unlock — **hand-written
+CUDA-graph capture of the decode step — is now implemented** (see Phase-1 results, 3.6×
+on 0.5B decode); wiring it into the speculative draft loop to flip the wall-clock result
+is the remaining integration.)
 
 ### Phase-3 results — true P/D disaggregation
 
@@ -105,7 +110,9 @@ and for an RDMA/NIXL backend over the wire.
   colocated. Remaining: SLO-aware router + draft-pool autoscaling.
 - **Phase 4 (in progress)** — FastAPI serving layer + Prometheus/Grafana observability
   + Poisson load testing (done); ablations + vLLM comparison (todo).
-- **Phase 5** — Triton kernels (paged + tree attention), EAGLE draft head, int4.
+- **Phase 5 (started)** — CUDA-graph decode capture (done: 3.6× on 0.5B, beats HF on
+  1.5B). Next: batched CUDA graphs for continuous batching, graph-accelerated spec draft
+  loop, Triton paged/tree-attention kernels, EAGLE draft head, int4.
 
 ### Serving layer + observability (Phase 4)
 
