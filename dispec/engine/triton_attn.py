@@ -69,11 +69,11 @@ def paged_decode_attention(q, k_cache, v_cache, slots, kv_groups, scale=None):
     scale = scale or head_dim ** -0.5
     o = torch.empty_like(q)
     slots = slots.to(torch.int32)
-    block_n = 64
+    # BLOCK_N=128 / num_warps=2 won a small sweep (best at longer contexts).
     _paged_decode_kernel[(num_heads,)](
         q, k_cache, v_cache, slots, o,
         ctx_len, scale, kv_groups,
         k_cache.stride(0), k_cache.stride(1),
-        HEAD_DIM=head_dim, BLOCK_N=block_n,
+        HEAD_DIM=head_dim, BLOCK_N=128, num_warps=2,
     )
     return o
