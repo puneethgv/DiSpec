@@ -13,10 +13,12 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
+from dispec.router import metrics as M
+from dispec.router.dashboard import DASHBOARD_HTML
 from dispec.router.server import InferenceServer
 
 
@@ -51,6 +53,26 @@ def create_app(model, tokenizer, **server_kwargs) -> FastAPI:
     @app.get("/metrics")
     async def get_metrics():
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    @app.get("/stats")
+    async def stats():
+        """Lightweight JSON snapshot for the built-in dashboard (no Prometheus needed)."""
+        def avg_ms(hist):
+            # prometheus_client Histogram count = sum of its (non-cumulative) buckets.
+            cnt = sum(b.get() for b in hist._buckets)
+            return (hist._sum.get() / cnt * 1e3) if cnt else 0.0
+        return {
+            "running": M.RUNNING._value.get(),
+            "waiting": M.WAITING._value.get(),
+            "requests_total": M.REQUESTS._value.get(),
+            "tokens_total": M.TOKENS._value.get(),
+            "ttft_avg_ms": avg_ms(M.TTFT),
+            "tpot_avg_ms": avg_ms(M.TPOT),
+        }
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    async def dashboard():
+        return DASHBOARD_HTML
 
     return app
 
