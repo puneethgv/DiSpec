@@ -1,4 +1,4 @@
-"""From-scratch forward pass for Qwen2-family models over a paged KV cache.
+"""From-scratch forward pass for Qwen2- and Qwen3-family models over a paged KV cache.
 
 We reuse the HuggingFace *weight modules* (embeddings, RMSNorms, q/k/v/o projections,
 SwiGLU MLP, lm_head) but implement the rotary embedding, KV cache read/write, and
@@ -70,6 +70,18 @@ class ModelRunner:
         self.kv_groups = self.num_heads // self.num_kv_heads
         self.scale = self.head_dim ** -0.5
 
+        # Qwen3 RMS-normalizes every query and key head (over head_dim) after projection
+        # and before RoPE; Qwen2 has no such norm. Detected once, not per layer per step.
+        attn0 = self.layers[0].self_attn
+        self.qk_norm = hasattr(attn0, "q_norm") and hasattr(attn0, "k_norm")
+
+        # The paged attention below is full-attention only. A sliding-window layer would
+        # attend to tokens the real model masks out, and nothing would fail loudly.
+        if "sliding_attention" in (getattr(cfg, "layer_types", None) or []):
+            raise ValueError(
+                f"{type(model).__name__} uses sliding-window attention layers, which the "
+                "paged attention path does not implement")
+
         # Reuse HF's rotary module so cos/sin exactly match the reference model
         # (config layout for rope_theta moved around across transformers versions).
         self.rotary_emb = core.rotary_emb
@@ -126,6 +138,9 @@ class ModelRunner:
             k = attn.k_proj(x).view(T, self.num_kv_heads, self.head_dim)
             v = attn.v_proj(x).view(T, self.num_kv_heads, self.head_dim)
 
+        if self.qk_norm:
+            q = attn.q_norm(q)
+            k = attn.k_norm(k)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
 

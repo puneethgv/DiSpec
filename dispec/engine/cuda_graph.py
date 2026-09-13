@@ -62,6 +62,9 @@ class CudaGraphDecoder:
                 q = attn.q_proj(h).view(1, r.num_heads, r.head_dim)
                 k = attn.k_proj(h).view(1, r.num_kv_heads, r.head_dim)
                 v = attn.v_proj(h).view(1, r.num_kv_heads, r.head_dim)
+            if r.qk_norm:  # Qwen3; must mirror ModelRunner._attention exactly
+                q = attn.q_norm(q)
+                k = attn.k_norm(k)
             q = _apply_rope(q, cos, sin)
             k = _apply_rope(k, cos, sin)
             self.cache.key[i].index_copy_(0, wslot, k)
