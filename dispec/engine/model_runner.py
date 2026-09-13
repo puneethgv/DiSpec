@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.bias import causal_lower_right
 
 from dispec.kv.paged_cache import PagedKVCache
 
@@ -159,30 +160,27 @@ class ModelRunner:
         out = torch.empty_like(q)
         offset = 0
         for meta in seq_meta:
-            qi = q[offset:offset + meta.q_len]  # (q_len, H, D)
-            ctx_slots = cache.context_slots(meta.block_ids, meta.ctx_len)
-            ki, vi = cache.gather(layer_idx, ctx_slots)  # (ctx_len, KVH, D)
+            end = offset + meta.q_len
+            if meta.ctx_len == meta.q_len:
+                # Fresh prefill: the whole context is the tokens projected and written
+                # above, so attend over them directly rather than gathering them back.
+                ki, vi = k[offset:end], v[offset:end]  # (ctx_len, KVH, D)
+            else:
+                ctx_slots = cache.context_slots(meta.block_ids, meta.ctx_len)
+                ki, vi = cache.gather(layer_idx, ctx_slots)  # (ctx_len, KVH, D)
 
-            # GQA: expand kv heads to query heads.
-            ki = ki.repeat_interleave(self.kv_groups, dim=1)  # (ctx, H, D)
-            vi = vi.repeat_interleave(self.kv_groups, dim=1)
-
-            # (H, q_len, D) and (H, ctx, D)
-            qh = qi.transpose(0, 1)
-            kh = ki.transpose(0, 1)
-            vh = vi.transpose(0, 1)
-
-            # Causal mask aligned to the right: new tokens are the last q_len of ctx.
-            past = meta.ctx_len - meta.q_len
-            qpos = torch.arange(meta.q_len, device=self.device)[:, None] + past
-            kpos = torch.arange(meta.ctx_len, device=self.device)[None, :]
-            mask = (kpos <= qpos)  # (q_len, ctx_len) bool, True = keep
-
-            oh = torch.nn.functional.scaled_dot_product_attention(
-                qh, kh, vh, attn_mask=mask[None, :, :]
-            )  # (H, q_len, D)
-            out[offset:offset + meta.q_len] = oh.transpose(0, 1)
-            offset += meta.q_len
+            # New tokens are the last q_len of the context, so the causal mask is aligned
+            # bottom-right. As a CausalBias rather than a materialized bool mask -- and
+            # with GQA handled inside the kernel rather than by copying KV heads -- SDPA
+            # can dispatch to FlashAttention / memory-efficient kernels. The bool mask
+            # ruled those out: 8192 tokens of Qwen3-4B took 3.5 s here vs 2.0 s in HF.
+            oh = F.scaled_dot_product_attention(
+                q[offset:end].transpose(0, 1)[None], ki.transpose(0, 1)[None],
+                vi.transpose(0, 1)[None],
+                attn_mask=causal_lower_right(meta.q_len, meta.ctx_len), enable_gqa=True,
+            )  # (1, H, q_len, D)
+            out[offset:end] = oh[0].transpose(0, 1)
+            offset = end
 
         return attn.o_proj(out.reshape(T, self.num_heads * self.head_dim))
 

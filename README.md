@@ -41,7 +41,7 @@ scheduler, a server).
   re-prefilling them, with LRU eviction under memory pressure.
 - **From-scratch Qwen2 / Qwen3 forward** (`dispec/engine/model_runner.py`) — custom rotary
   embeddings, grouped-query attention, Qwen3's per-head q/k norm, and right-aligned causal
-  masking over the paged cache. Verified against HuggingFace at the logits level (per-position cosine ≈ 0.99995,
+  masking over the paged cache, expressed as a causal bias so prefill runs on FlashAttention. Verified against HuggingFace at the logits level (per-position cosine ≈ 0.99995,
   same argmax).
 - **Continuous batching** (`dispec/sched/scheduler.py`) — iteration-level scheduling that
   mixes prefill and decode tokens in one forward pass, bounded by a token budget, with
@@ -68,9 +68,9 @@ scheduler, a server).
   `/metrics`, a built-in live `/dashboard`, an optional Grafana stack, SLO priority routing,
   and a draft-pool autoscaler.
 
-59 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
+70 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
 math, spec decoding, transports, disaggregation, CUDA graphs, the HTTP server, the
-autoscaler, the Qwen3 forward, cross-model KV transfer).
+autoscaler, the Qwen3 forward, prefill attention, cross-model KV transfer).
 
 ## Numbers
 
@@ -135,25 +135,31 @@ CUDA IPC moves the same KV by passing the GPU buffer's handle: zero-copy, consta
 disaggregated output is token-for-token identical to running it all on one process (tested),
 which is the thing that actually has to be true.
 
-**Cross-model KV transfer** — escalating Qwen3-1.7B → Qwen3-4B on one L4, bf16
-(`bench/kvxfer_bench.py`). *Target prefill* is what escalation avoids. *warm* is what it
-costs instead when the 1.7B model has already served the prompt: map its KV (export + RoPE
-strip/re-apply + per-layer map) and inject it (import + one 4B forward for the last prompt
-token). *cold* adds the 1.7B prefill.
+**Cross-model KV transfer** — escalating Qwen3-1.7B → Qwen3-4B on one L4, bf16, on the serving
+fast path (Triton decode + fused GEMMs; `bench/kvxfer_bench.py`). Escalation avoids the 4B model
+prefilling the prompt. *warm* is what it costs instead when the 1.7B model has already served the
+prompt: map its KV (export + RoPE strip/re-apply + per-layer map) and inject it (import + one 4B
+forward for the last prompt token). *cold* adds the 1.7B prefill. Speedups are against vLLM's
+prefill on the same GPU type (vLLM 0.11, prefix caching off, measured in kvxfer).
 
-| tokens | Qwen3-4B prefill | ridge warm | ridge + residual warm | ridge + residual cold |
-|---|---|---|---|---|
-| 512 | 116.7 ms | 92.0 ms (1.27×) | 97.1 ms (1.20×) | 158.1 ms (0.74×) |
-| 1024 | 246.6 ms | 100.5 ms (2.45×) | 107.2 ms (2.30×) | 209.4 ms (1.18×) |
-| 2048 | 488.8 ms | 133.1 ms (3.67×) | 148.4 ms (3.29×) | 352.5 ms (1.39×) |
-| 4096 | 1240.9 ms | 209.4 ms (5.93×) | 235.8 ms (5.26×) | 749.9 ms (1.65×) |
-| 8192 | 3501.8 ms | 396.9 ms (8.82×) | 454.4 ms (7.71×) | 1911.0 ms (1.83×) |
+| tokens | vLLM 4B prefill | DiSpec 4B prefill | warm | cold | cold, 1.7B prefill on vLLM |
+|---|---|---|---|---|---|
+| 512 | 106.1 ms | 105.8 ms | 71.0 ms (1.49×) | 119.0 ms (0.89×) | 113.6 ms (0.93×) |
+| 1024 | 175.1 ms | 187.5 ms | 76.4 ms (2.29×) | 157.1 ms (1.11×) | 149.7 ms (1.17×) |
+| 2048 | 332.9 ms | 374.0 ms | 106.4 ms (3.13×) | 265.5 ms (1.25×) | 254.7 ms (1.31×) |
+| 4096 | 723.9 ms | 874.4 ms | 173.9 ms (4.16×) | 532.2 ms (1.36×) | 490.9 ms (1.47×) |
+| 8192 | 1653.0 ms | 2000.5 ms | 347.2 ms (4.76×) | 1199.2 ms (1.38×) | 1013.1 ms (1.63×) |
 
-Ratios are against DiSpec's own prefill, which is ~2× slower than vLLM's at 8k tokens. Against
-vLLM's prefill on the same GPU type (1653 ms at 8192 tokens, measured in kvxfer), warm is 4.2×
-(ridge) / 3.6× (residual) at 8192 and ~1.1× at 512: the gain grows with prompt length and is
-negligible for short prompts. The trained residual adds 5–58 ms over ridge. Cold never exceeds
-1.83×, because the 1.7B prefill it pays for is already ~40% of the 4B one.
+These are the ridge maps; the trained residual adds 5–58 ms (warm 1.35–4.08×, cold 0.84–1.31×).
+Below ~1k tokens the ~50 ms one-token inject dominates and the gain is small. Cold beats vLLM from
+1k tokens up even with the 1.7B prefill on DiSpec, and reaches 1.63× when that prefill runs on
+vLLM. It cannot go much higher for this pair: the 1.7B prefill alone is 40–45% of the 4B one, so
+even a free transfer would cap cold at ~2.4×.
+
+Cold only overtook vLLM after one engine change. Prefill attention used an explicit causal mask,
+which kept SDPA off its FlashAttention kernel; expressed as a `causal_lower_right` bias instead,
+DiSpec's 4B prefill at 8192 tokens dropped from 3502 ms to 2000 ms, and cold from 0.89× to 1.38×
+of vLLM. Decode throughput is unchanged (the all-decode step uses the Triton kernel).
 
 The two models together are ~11.5 GB in bf16, so this does **not** fit the 8 GB GPU the rest
 of the numbers are from; the maps add ~0.8 GB. Only models with identical KV heads, head dim
@@ -207,7 +213,7 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 
 .venv/bin/python -m dispec.env_check     # check GPU / bf16 / triton
-.venv/bin/python -m pytest -q            # 59 tests (CUDA ones skip without a GPU)
+.venv/bin/python -m pytest -q            # 70 tests (CUDA ones skip without a GPU)
 
 # benchmarks
 .venv/bin/python -m bench.ablations      # the throughput table above
@@ -256,7 +262,7 @@ dispec/
 bench/               ablations, throughput, baseline_hf, dispec_bench, spec_bench,
                      disagg_bench, kvxfer_bench, load_gen, vllm_ref
 dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Grafana config
-tests/               59 tests
+tests/               70 tests
 ```
 
 This is a learning/portfolio project, not a production server — the aim is an end-to-end
