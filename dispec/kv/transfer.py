@@ -240,13 +240,17 @@ class CrossModelKVMap:
         return self.keys[0].residual is not None
 
     # -- apply -----------------------------------------------------------------
-    def _apply(self, source: torch.Tensor, maps: list[LayerMap], use_residual: bool):
+    def _apply(self, source: torch.Tensor, maps: list[LayerMap], use_residual: bool,
+               rope: tuple[torch.Tensor, torch.Tensor] | None = None):
         seq = source.shape[1]
         out = torch.empty(len(maps), seq, self.num_kv_heads, self.head_dim,
                           dtype=self.dtype, device=source.device)
         for layer, m in enumerate(maps):
             x = source[list(m.source_layers)].permute(1, 0, 2, 3).reshape(seq, -1)
-            out[layer] = m.apply(x, use_residual).view(seq, self.num_kv_heads, self.head_dim)
+            y = m.apply(x, use_residual).view(1, seq, self.num_kv_heads, self.head_dim)
+            if rope is not None:
+                y = apply_rope(y, *rope)  # float32, one layer at a time
+            out[layer] = y[0]
         return out
 
     @torch.inference_mode()
@@ -266,8 +270,14 @@ class CrossModelKVMap:
             (k, v) for the target, (target_layers, T, H, D), keys rotated, in the
             input dtype.
         """
-        content = strip_rope(k, *source_rope).to(self.dtype)
-        keys = self._apply(content, self.keys, use_residual)
+        # RoPE is stripped and re-applied in float32, but one layer at a time. Doing it
+        # on the whole cache holds a float32 copy plus two same-sized intermediates --
+        # about 3 GB for 8k tokens of a 28-layer model -- and ran an L4 out of memory
+        # at 8k tokens with both models resident.
+        content = torch.empty(k.shape, dtype=self.dtype, device=k.device)
+        for layer in range(k.shape[0]):
+            content[layer] = strip_rope(k[layer:layer + 1], *source_rope)[0]
+        keys = self._apply(content, self.keys, use_residual, rope=target_rope)
+        del content
         values = self._apply(v.to(self.dtype), self.values, use_residual)
-        keys = apply_rope(keys, *target_rope)
         return keys.to(k.dtype), values.to(v.dtype)
