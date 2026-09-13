@@ -1,8 +1,8 @@
 # DiSpec — a from-scratch LLM inference engine
 
 DiSpec is a from-scratch LLM serving engine that implements the internals of systems like
-vLLM directly rather than calling them. It runs real models (Qwen2.5, Qwen3) on a single 8 GB
-laptop GPU and covers the whole path: a paged KV cache with prefix sharing, a continuous-batching
+vLLM directly rather than calling them. It runs real models (Qwen2.5, Qwen3) on a single GPU
+and covers the whole path: a paged KV cache with prefix sharing, a continuous-batching
 scheduler, the model forward pass, CUDA-graph decode, speculative decoding, prefill/decode
 disaggregation with KV transfer, cross-model KV transfer for escalating a request from a small
 model to a large one, and an OpenAI-compatible HTTP server with metrics.
@@ -41,8 +41,8 @@ scheduler, a server).
   re-prefilling them, with LRU eviction under memory pressure.
 - **From-scratch Qwen2 / Qwen3 forward** (`dispec/engine/model_runner.py`) — custom rotary
   embeddings, grouped-query attention, Qwen3's per-head q/k norm, and right-aligned causal
-  masking over the paged cache, expressed as a causal bias so prefill runs on FlashAttention. Verified against HuggingFace at the logits level (per-position cosine ≈ 0.99995,
-  same argmax).
+  masking over the paged cache, expressed as a causal bias so prefill runs on FlashAttention. Checked against HuggingFace at
+  the logits level (tests require per-position cosine ≥ 0.999 and matching argmax).
 - **Continuous batching** (`dispec/sched/scheduler.py`) — iteration-level scheduling that
   mixes prefill and decode tokens in one forward pass, bounded by a token budget, with
   priority-aware admission, and chunked prefill (long prompts slice into the batch
@@ -74,66 +74,95 @@ autoscaler, the Qwen3 forward, prefill attention, cross-model KV transfer).
 
 ## Numbers
 
-All on Qwen2.5-1.5B, RTX 3070 Laptop (8 GB), bf16, greedy.
+Measured on one NVIDIA L4 on Modal (8 vCPUs), bf16, greedy decoding, torch 2.14, transformers
+5.16.1, vLLM 0.11. Every table up to the cross-model KV transfer section comes from a single run
+in one container, using the scripts named. HuggingFace `generate` is warmed up before it is
+timed, like every DiSpec configuration.
 
-**Single-sequence** — each row adds one technique (`bench/ablations.py`):
+**Single sequence** — Qwen2.5-1.5B, the six `BENCH_PROMPTS`, 96 new tokens, mean of two runs
+(`bench/ablations.py`):
 
-| Config | tok/s | vs HF |
+| config | tok/s | vs HF |
 |---|---|---|
-| HuggingFace `generate` | 51 | 1.0× |
-| DiSpec single-sequence, eager | 40 | 0.78× |
-| DiSpec single-sequence + CUDA graph | 68 | 1.32× |
+| HuggingFace `generate` | 27.4 | 1.00× |
+| DiSpec single-sequence, eager | 24.5 | 0.90× |
+| DiSpec single-sequence + CUDA graph | 62.6 | 2.29× |
 
-Eager single-stream is slower than HF — it's a Python loop over 28 layers and launch
-overhead dominates. CUDA-graph capture of the decode step fixes that (3.6× on 0.5B, 1.7× on
-1.5B) and passes HF.
+Eager single-stream is slower than HF — it is a Python loop over 28 layers, and per-step kernel
+launch overhead dominates. Capturing the decode step as a CUDA graph replays it as a single
+launch: 2.6× over eager, and past HF. On Qwen3-1.7B the same path runs at 55.0 tok/s against
+HF's 21.1 (2.60×).
 
-**Continuous-batching throughput vs vLLM**, matched concurrency, warmed
-(`bench/throughput.py` and `bench/vllm_ref.py`):
+**Prefill** — time to first token on long prompts, Qwen2.5-1.5B (`bench/prefill_bench.py`):
 
-| concurrency | DiSpec (Triton + fused) | vLLM | gap |
+| tokens | HuggingFace | DiSpec | DiSpec / HF |
 |---|---|---|---|
-| 6 | 373 tok/s | 528 | 1.4× |
-| 16 | 858 tok/s | 1337 | 1.6× |
-| 32 | 1426 tok/s | 2498 | 1.75× |
+| 512 | 39.3 ms | 39.0 ms | 0.99× |
+| 1024 | 75.6 ms | 78.0 ms | 1.03× |
+| 2048 | 152.5 ms | 150.8 ms | 0.99× |
+| 4096 | 303.1 ms | 305.9 ms | 1.01× |
+| 8192 | 726.2 ms | 711.1 ms | 0.98× |
 
-The gap to vLLM narrows from ~6× to **~1.5×**. The changes that account for it, in order of
-impact: building the per-step attention slot table **once** instead of per-layer; a
-**batched** Triton decode kernel (one launch for the whole batch instead of a Python loop over
-sequences); fused QKV / gate-up GEMMs; and CUDA-graph decode. The remaining ~1.5× is full
-CUDA-graph capture of the *batched* step and FlashAttention-grade kernels — diminishing
-returns. (Liger kernels were tried and were *slower* for single-token decode; they target
-training-size shapes. flash-attn / FlashInfer have no torch-2.12/CUDA-13 wheel, so the Triton
-kernel here is implemented directly.)
+Prefill attention passes its right-aligned causal mask to SDPA as a `causal_lower_right` bias,
+with GQA handled inside the kernel, so it dispatches to FlashAttention. With the materialized
+boolean mask it used before, the same benchmark measured DiSpec at 1.14–1.59× HF's prefill time
+(1136 ms at 8192 tokens). Qwen3-1.7B is also at parity (0.98–1.01×).
 
-**Speculative decoding** is lossless and accepts ~50% of drafted tokens (~3.6 tokens per
-target step), but the wall-clock speedup is currently **below 1×**. Profiling shows why:
+**Continuous batching** — Qwen2.5-1.5B on the serving fast path (Triton decode kernel + fused
+GEMMs) against vLLM, on the same chat-templated prompts at the same concurrency, 96 new tokens,
+median of three runs (`bench/throughput.py`, `bench/vllm_ref.py`). vLLM's prefix caching is off,
+since DiSpec's batching engine has none and the replicated prompts would let vLLM skip prefill.
 
-| Forward (7B-int4 target / 0.5B draft) | time |
+| concurrency | DiSpec | vLLM | vLLM / DiSpec |
+|---|---|---|---|
+| 6 | 194 tok/s | 395 tok/s | 2.0× |
+| 16 | 489 tok/s | 994 tok/s | 2.0× |
+| 32 | 864 tok/s | 1758 tok/s | 2.0× |
+
+vLLM ran before and after DiSpec in the same container and moved by at most 0.2%. DiSpec's
+batched decode is more sensitive to the host: the same code measured 279 / 681 / 1185 tok/s in a
+different L4 container, a 1.4× gap against vLLM's numbers there, while vLLM stayed within ~2% of
+the figures above. Expect a 1.4–2.0× gap depending on the machine.
+
+What gets DiSpec this far: building the per-step attention slot table once instead of per layer,
+a batched Triton decode kernel (one launch for the whole batch rather than a Python loop over
+sequences), and fused QKV and gate/up GEMMs. vLLM additionally captures its batched decode as
+CUDA graphs; DiSpec's batched step runs eagerly.
+
+**Speculative decoding** is lossless, but here it is slower than decoding without it:
+Qwen2.5-1.5B with the 0.5B draft and K=5 runs at 13.2 tok/s (0.48× HF), accepting 49% of drafted
+tokens; Qwen3-1.7B with a 0.6B draft gives 10.1 tok/s (0.48×). `bench/spec_profile.py` shows why:
+
+| forward (Qwen2.5-1.5B target / 0.5B draft) | time |
 |---|---|
-| target decode, 1 token | 31.9 ms |
-| target verify, 5 tokens | 32.0 ms |
-| draft decode, 1 token | 20.2 ms |
+| target, 1 token | 41.3 ms |
+| target, 5 tokens (verify) | 42.4 ms |
+| draft, 1 token, eager | 35.0 ms |
+| draft, 1 token, CUDA graph | 6.5 ms |
 
-Verifying 5 tokens costs the same as decoding 1 — so the *idea* works perfectly, the target
-forward is pure launch overhead and amortizes for free. The problem is the draft: it's also
-~20 ms of launch overhead (a 0.5B model is ~3 ms of actual compute), so the handful of draft
-steps cost more than the target call they save. The fix is not a bigger target (an int4 7B
-target gives the same result); it is making the draft cheap with CUDA graphs. The graph
-machinery already exists for plain decode; wiring it into the draft loop is what would flip
-this positive.
+Verifying five tokens costs about the same as decoding one, so the target side works as
+intended. The draft is the problem: an eager 0.5B forward costs almost as much as the 1.5B
+target's, because both are dominated by per-layer launch overhead rather than compute. Each
+iteration runs a verify and a correction forward on the target plus five draft forwards — about
+259 ms for 3.35 tokens, 12.9 tok/s, in line with the measured end-to-end rate. Replaying the draft
+as a CUDA graph (6.5 ms) would bring an iteration to ~116 ms, ~29 tok/s: faster than eager target
+decode (24 tok/s) but under half of what CUDA-graph decode gives the target alone (62.6 tok/s).
+Speculation needs the target's verify and correction forwards captured as graphs too.
 
-**KV transfer** for disaggregation (Qwen2.5-7B KV geometry):
+**KV transfer** for disaggregation, Qwen2.5-7B KV geometry, TCP over localhost
+(`bench/disagg_bench.py`, one transfer per size):
 
 | prompt length | KV size | TCP transfer | throughput |
 |---|---|---|---|
-| 512 | 29 MB | 99 ms | 0.30 GB/s |
-| 2048 | 117 MB | 350 ms | 0.34 GB/s |
+| 128 | 7.3 MB | 45.8 ms | 0.16 GB/s |
+| 512 | 29.4 MB | 112.9 ms | 0.26 GB/s |
+| 1024 | 58.7 MB | 168.7 ms | 0.35 GB/s |
+| 2048 | 117.4 MB | 381.3 ms | 0.31 GB/s |
 
-TCP is serialize-and-copy bound and scales with payload size — it's the multi-node fallback.
-CUDA IPC moves the same KV by passing the GPU buffer's handle: zero-copy, constant time. The
-disaggregated output is token-for-token identical to running it all on one process (tested),
-which is the thing that actually has to be true.
+TCP is serialize-and-copy bound and its cost grows with the payload — it is the multi-node
+fallback. CUDA IPC moves the same KV by passing the GPU buffer's handle instead of the bytes, so
+nothing is copied between processes. The disaggregated output is token-for-token identical to
+running it all in one process (tested), which is the thing that actually has to be true.
 
 **Cross-model KV transfer** — escalating Qwen3-1.7B → Qwen3-4B on one L4, bf16, on the serving
 fast path (Triton decode + fused GEMMs; `bench/kvxfer_bench.py`). Escalation avoids the 4B model
@@ -161,8 +190,8 @@ which kept SDPA off its FlashAttention kernel; expressed as a `causal_lower_righ
 DiSpec's 4B prefill at 8192 tokens dropped from 3502 ms to 2000 ms, and cold from 0.89× to 1.38×
 of vLLM. Decode throughput is unchanged (the all-decode step uses the Triton kernel).
 
-The two models together are ~11.5 GB in bf16, so this does **not** fit the 8 GB GPU the rest
-of the numbers are from; the maps add ~0.8 GB. Only models with identical KV heads, head dim
+The two models together are ~11.5 GB in bf16, and the maps add ~0.8 GB. Only models with
+identical KV heads, head dim
 and tokenizer can be paired — which is why DiSpec's own draft/target pair can't use it
 (Qwen2.5-0.5B has `head_dim=64`, 1.5B has 128).
 
@@ -216,7 +245,10 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 .venv/bin/python -m pytest -q            # 70 tests (CUDA ones skip without a GPU)
 
 # benchmarks
-.venv/bin/python -m bench.ablations      # the throughput table above
+.venv/bin/python -m bench.ablations      # single-sequence table
+.venv/bin/python -m bench.prefill_bench  # prefill vs HuggingFace
+.venv/bin/python -m bench.throughput     # continuous batching (pair with bench/vllm_ref.py)
+.venv/bin/python -m bench.spec_profile   # why speculative decoding is below 1x
 .venv/bin/python -m bench.spec_bench     # speculative decoding (--gptq for the int4 7B target)
 .venv/bin/python -m bench.disagg_bench   # KV-transfer cost
 .venv/bin/python -m bench.kvxfer_bench --artifacts <kvxfer pair dir>   # escalation (~12 GB GPU)
@@ -259,8 +291,8 @@ dispec/
                      escalation.py — small → large model hand-off with mapped KV
   router/            app.py (FastAPI), server.py (scheduler thread), metrics.py,
                      dashboard.py (built-in UI), autoscale.py (draft-pool controller)
-bench/               ablations, throughput, baseline_hf, dispec_bench, spec_bench,
-                     disagg_bench, kvxfer_bench, load_gen, vllm_ref
+bench/               ablations, prefill_bench, throughput, baseline_hf, dispec_bench,
+                     spec_bench, spec_profile, disagg_bench, kvxfer_bench, load_gen, vllm_ref
 dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Grafana config
 tests/               70 tests
 ```
