@@ -30,6 +30,10 @@ from dispec.spec.speculative import SpeculativeEngine
 
 
 def hf_single(model, tok, prompts, max_new):
+    # Warm up like every DiSpec row does, so HF is not charged for the CUDA init and kernel
+    # selection that the first-ever generate call pays.
+    ids = tok(build_prompt(tok, prompts[0]), return_tensors="pt").input_ids.to(model.device)
+    model.generate(ids, max_new_tokens=8, do_sample=False, pad_token_id=tok.pad_token_id)
     tps = []
     for p in prompts:
         ids = tok(build_prompt(tok, p), return_tensors="pt").input_ids.to(model.device)

@@ -11,6 +11,7 @@ Run: python -m bench.throughput [--max-new 96]
 from __future__ import annotations
 
 import argparse
+import statistics
 import time
 
 import torch
@@ -43,6 +44,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-new", type=int, default=96)
     ap.add_argument("--concurrency", type=int, nargs="+", default=[6, 16, 32])
+    ap.add_argument("--repeats", type=int, default=3, help="runs per concurrency; median reported")
     args = ap.parse_args()
 
     tok = load_tokenizer(TARGET_MODEL)
@@ -54,7 +56,9 @@ def main() -> None:
 
     print(f"\nContinuous batching (Triton + fused), Qwen2.5-1.5B:")
     for c in args.concurrency:
-        print(f"  concurrency={c:>3}: {measure(tok, prompts, c, args.max_new):.1f} tok/s")
+        runs = [measure(tok, prompts, c, args.max_new) for _ in range(args.repeats)]
+        print(f"  concurrency={c:>3}: {statistics.median(runs):.1f} tok/s  "
+              f"(runs {', '.join(f'{r:.1f}' for r in runs)})")
 
 
 if __name__ == "__main__":
