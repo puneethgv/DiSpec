@@ -45,6 +45,10 @@ class Request:
     prefilled: bool = False
     priority: int = 0  # higher = admitted sooner (SLO-aware routing)
     prefill_pos: int = 0  # prompt tokens prefilled so far (chunked prefill)
+    # Contiguous (layers, n, kv_heads, head_dim) KV for the first n prompt tokens,
+    # computed elsewhere -- e.g. mapped from a smaller model (dispec/kv/transfer.py).
+    # Imported at admission; prefill then resumes at token n. Cleared once imported.
+    prefix_kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @property
     def done(self) -> bool:
@@ -80,11 +84,32 @@ class ContinuousBatchingEngine:
 
     def add_request(self, prompt_ids: list[int], max_new_tokens: int,
                     params: SamplingParams | None = None, eos_id: int | None = None,
-                    priority: int = 0) -> int:
+                    priority: int = 0,
+                    prefix_kv: tuple[torch.Tensor, torch.Tensor] | None = None) -> int:
+        """Queue a request.
+
+        `prefix_kv` supplies KV for the first n prompt tokens so they are never
+        prefilled. It must cover fewer tokens than the prompt: the logits that pick the
+        first output token come from forwarding the last prompt token, so at least that
+        one has to go through the model.
+        """
+        if prefix_kv is not None:
+            self._check_prefix_kv(prefix_kv, len(prompt_ids))
         req = Request(next(self._ids), list(prompt_ids), params or SamplingParams(),
-                      max_new_tokens, eos_id, priority=priority)
+                      max_new_tokens, eos_id, priority=priority, prefix_kv=prefix_kv)
         self.waiting.append(req)
         return req.id
+
+    def _check_prefix_kv(self, prefix_kv, prompt_len: int) -> None:
+        k, v = prefix_kv
+        c = self.cache
+        expected = (c.num_layers, k.shape[1], c.num_kv_heads, c.head_dim)
+        if tuple(k.shape) != expected or tuple(v.shape) != expected:
+            raise ValueError(f"prefix_kv shapes {tuple(k.shape)}/{tuple(v.shape)} do not "
+                             f"match this model's cache layout {expected}")
+        if not 0 < k.shape[1] < prompt_len:
+            raise ValueError(f"prefix_kv covers {k.shape[1]} tokens of a {prompt_len}-token "
+                             "prompt; it must cover at least one and fewer than all of them")
 
     # -- one scheduling iteration -------------------------------------------
     @torch.inference_mode()
@@ -137,6 +162,12 @@ class ContinuousBatchingEngine:
                 except OutOfBlocksError:
                     break
                 table.num_tokens = 0
+                if req.prefix_kv is not None:
+                    k, v = req.prefix_kv
+                    dev_kv = self.cache.key.device
+                    self.cache.import_contiguous(table.block_ids, k.to(dev_kv), v.to(dev_kv))
+                    req.prefill_pos = table.num_tokens = k.shape[1]
+                    req.prefix_kv = None  # the paged cache owns it now
                 req.state = State.PREFILLING
                 self.waiting.remove(req)
                 self.prefilling.append(req)

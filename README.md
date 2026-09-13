@@ -1,10 +1,11 @@
 # DiSpec — a from-scratch LLM inference engine
 
 DiSpec is a from-scratch LLM serving engine that implements the internals of systems like
-vLLM directly rather than calling them. It runs real models (Qwen2.5) on a single 8 GB laptop
-GPU and covers the whole path: a paged KV cache with prefix sharing, a continuous-batching
+vLLM directly rather than calling them. It runs real models (Qwen2.5, Qwen3) on a single 8 GB
+laptop GPU and covers the whole path: a paged KV cache with prefix sharing, a continuous-batching
 scheduler, the model forward pass, CUDA-graph decode, speculative decoding, prefill/decode
-disaggregation with KV transfer, and an OpenAI-compatible HTTP server with metrics.
+disaggregation with KV transfer, cross-model KV transfer for escalating a request from a small
+model to a large one, and an OpenAI-compatible HTTP server with metrics.
 
 PyTorch/HuggingFace is used only for the raw matmuls (and the pretrained weights). Everything
 around them — cache layout, attention masking, scheduling, sampling, the speculative-decoding
@@ -38,9 +39,9 @@ scheduler, a server).
 - **Prefix caching** (`dispec/kv/prefix_cache.py`) — requests that share a leading prefix
   (system prompt, few-shot preamble, chat history) reuse cached KV blocks instead of
   re-prefilling them, with LRU eviction under memory pressure.
-- **From-scratch Qwen2 forward** (`dispec/engine/model_runner.py`) — custom rotary
-  embeddings, grouped-query attention, and right-aligned causal masking over the paged
-  cache. Verified against HuggingFace at the logits level (per-position cosine ≈ 0.99995,
+- **From-scratch Qwen2 / Qwen3 forward** (`dispec/engine/model_runner.py`) — custom rotary
+  embeddings, grouped-query attention, Qwen3's per-head q/k norm, and right-aligned causal
+  masking over the paged cache. Verified against HuggingFace at the logits level (per-position cosine ≈ 0.99995,
   same argmax).
 - **Continuous batching** (`dispec/sched/scheduler.py`) — iteration-level scheduling that
   mixes prefill and decode tokens in one forward pass, bounded by a token budget, with
@@ -56,14 +57,20 @@ scheduler, a server).
 - **P/D disaggregation** (`dispec/transport/`, `dispec/workers/`) — prefill and decode as
   separate processes with a pluggable KV transport: zero-copy CUDA IPC on one node, TCP for
   multi-node.
+- **Cross-model KV transfer** (`dispec/kv/transfer.py`, `dispec/workers/escalation.py`) —
+  escalate a request from Qwen3-1.7B to Qwen3-4B without the 4B model prefilling the prompt.
+  The small model's KV cache is mapped into the large model's layout by per-layer linear maps
+  (plus a small trained residual) fitted offline by
+  [kvxfer](https://github.com/puneethgv/kvxfer), then admitted to the scheduler as prefix KV,
+  so the 4B model forwards a single token before decoding.
 - **Serving + observability** (`dispec/router/`) — a FastAPI server with an
   OpenAI-compatible `/v1/chat/completions` endpoint (streaming + non-streaming), Prometheus
   `/metrics`, a built-in live `/dashboard`, an optional Grafana stack, SLO priority routing,
   and a draft-pool autoscaler.
 
-34 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
+59 tests cover all of it (cache, prefix cache, forward correctness, batching, rejection
 math, spec decoding, transports, disaggregation, CUDA graphs, the HTTP server, the
-autoscaler).
+autoscaler, the Qwen3 forward, cross-model KV transfer).
 
 ## Numbers
 
@@ -128,6 +135,54 @@ CUDA IPC moves the same KV by passing the GPU buffer's handle: zero-copy, consta
 disaggregated output is token-for-token identical to running it all on one process (tested),
 which is the thing that actually has to be true.
 
+**Cross-model KV transfer** — escalating Qwen3-1.7B → Qwen3-4B on one L4, bf16
+(`bench/kvxfer_bench.py`). *Target prefill* is what escalation avoids. *warm* is what it
+costs instead when the 1.7B model has already served the prompt: map its KV (export + RoPE
+strip/re-apply + per-layer map) and inject it (import + one 4B forward for the last prompt
+token). *cold* adds the 1.7B prefill.
+
+| tokens | Qwen3-4B prefill | ridge warm | ridge + residual warm | ridge + residual cold |
+|---|---|---|---|---|
+| 512 | 116.7 ms | 92.0 ms (1.27×) | 97.1 ms (1.20×) | 158.1 ms (0.74×) |
+| 1024 | 246.6 ms | 100.5 ms (2.45×) | 107.2 ms (2.30×) | 209.4 ms (1.18×) |
+| 2048 | 488.8 ms | 133.1 ms (3.67×) | 148.4 ms (3.29×) | 352.5 ms (1.39×) |
+| 4096 | 1240.9 ms | 209.4 ms (5.93×) | 235.8 ms (5.26×) | 749.9 ms (1.65×) |
+| 8192 | 3501.8 ms | 396.9 ms (8.82×) | 454.4 ms (7.71×) | 1911.0 ms (1.83×) |
+
+Ratios are against DiSpec's own prefill, which is ~2× slower than vLLM's at 8k tokens. Against
+vLLM's prefill on the same GPU type (1653 ms at 8192 tokens, measured in kvxfer), warm is 4.2×
+(ridge) / 3.6× (residual) at 8192 and ~1.1× at 512: the gain grows with prompt length and is
+negligible for short prompts. The trained residual adds 5–58 ms over ridge. Cold never exceeds
+1.83×, because the 1.7B prefill it pays for is already ~40% of the 4B one.
+
+The two models together are ~11.5 GB in bf16, so this does **not** fit the 8 GB GPU the rest
+of the numbers are from; the maps add ~0.8 GB. Only models with identical KV heads, head dim
+and tokenizer can be paired — which is why DiSpec's own draft/target pair can't use it
+(Qwen2.5-0.5B has `head_dim=64`, 1.5B has 128).
+
+It is a **latency** feature, not a quality one. kvxfer's evaluation of the same maps
+(prefix-conditioned perplexity over 64 documents; 300-item ARC):
+
+| | perplexity | ARC-Easy | ARC-Challenge |
+|---|---|---|---|
+| Qwen3-4B, own prefill | 13.56 | 0.850 | 0.497 |
+| 4B with mapped cache, ridge + residual | 14.11 | 0.733 | 0.353 |
+| 4B with mapped cache, ridge | 14.71 | 0.740 | 0.323 |
+| Qwen3-1.7B alone | 16.48 | 0.747 | 0.380 |
+
+The mapped cache makes the 4B model a better language model than the 1.7B model, but not a
+more accurate one on ARC — escalating through it buys less than a real 4B prefill would.
+
+Greedy agreement with the 4B model's own output over 32 tokens on the six `BENCH_PROMPTS` — a
+coarse signal, since bf16 near-ties flip tokens — points the same way: the escalated 4B model
+matches the real 4B model's first token on 67% of prompts (ridge and residual) against 50% for
+the 1.7B model alone, with a matched prefix of 3.5–3.7 tokens against 2.5.
+
+Correctness is gated rather than assumed: a model's own KV admitted through the transfer path
+(raw, and through an identity map) must reproduce a plain prefill; DiSpec's map must agree with
+kvxfer's reference implementation on identical inputs; and the trained map must predict the
+4B model's next token with lower KL divergence than a zeroed cache.
+
 ## How it fits together
 
 ```
@@ -141,6 +196,8 @@ which is the thing that actually has to be true.
                                               (CUDA IPC / TCP)
 
        speculative mode:    draft model ──proposes──► target model verifies (rejection sampling)
+
+       escalation mode:     small model ──KV map (kvxfer)──► large model decodes, no prefill
 ```
 
 ## Running it
@@ -150,12 +207,13 @@ uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 
 .venv/bin/python -m dispec.env_check     # check GPU / bf16 / triton
-.venv/bin/python -m pytest -q            # 32 tests
+.venv/bin/python -m pytest -q            # 59 tests (CUDA ones skip without a GPU)
 
 # benchmarks
 .venv/bin/python -m bench.ablations      # the throughput table above
 .venv/bin/python -m bench.spec_bench     # speculative decoding (--gptq for the int4 7B target)
 .venv/bin/python -m bench.disagg_bench   # KV-transfer cost
+.venv/bin/python -m bench.kvxfer_bench --artifacts <kvxfer pair dir>   # escalation (~12 GB GPU)
 
 # serve it
 .venv/bin/python -m dispec.router.app    # http://localhost:8000  (/generate, /metrics, /dashboard)
@@ -171,6 +229,12 @@ The int4 GPTQ target (`bench.spec_bench --gptq`) needs the `quant` extra
 want to reproduce the reference number, goes in a separate venv (`bench/vllm_ref.py`) since it
 ships its own torch.
 
+Cross-model KV transfer needs maps from [kvxfer](https://github.com/puneethgv/kvxfer)
+(`scripts/calibrate.py` → `scripts/fit_maps.py` → `scripts/train_residual.py`). `--artifacts`
+points at a directory holding its `maps/` and `residual/` outputs; they are ~1.6 GB and not
+committed here. Maps fitted for other models are rejected on load unless the KV geometry and
+tokenizer match.
+
 ## Layout
 
 ```
@@ -179,19 +243,20 @@ dispec/
   sampling.py        greedy / top-k / top-p, written for the rejection-sampling math
   env_check.py       GPU / bf16 / triton check
   kv/                block_manager.py (paged allocator + COW), paged_cache.py (GPU pool),
-                     prefix_cache.py (shared-prefix KV reuse)
-  engine/            model_runner.py (Qwen2 forward), engine.py (single-seq),
+                     prefix_cache.py (shared-prefix KV reuse), transfer.py (cross-model KV map)
+  engine/            model_runner.py (Qwen2/Qwen3 forward), engine.py (single-seq),
                      cuda_graph.py, triton_attn.py (fused paged-attention kernel)
   sched/             scheduler.py (continuous batching + priority admission)
   spec/              rejection.py (lossless verify), speculative.py (draft + target)
   transport/         base / cuda_ipc / tcp — the KV-transfer engine
-  workers/           disaggregated.py — prefill & decode worker processes
+  workers/           disaggregated.py — prefill & decode worker processes,
+                     escalation.py — small → large model hand-off with mapped KV
   router/            app.py (FastAPI), server.py (scheduler thread), metrics.py,
                      dashboard.py (built-in UI), autoscale.py (draft-pool controller)
 bench/               ablations, throughput, baseline_hf, dispec_bench, spec_bench,
-                     disagg_bench, load_gen, vllm_ref
+                     disagg_bench, kvxfer_bench, load_gen, vllm_ref
 dashboards/          dispec.json (Grafana)        monitoring/  Prometheus + Grafana config
-tests/               34 tests
+tests/               59 tests
 ```
 
 This is a learning/portfolio project, not a production server — the aim is an end-to-end
