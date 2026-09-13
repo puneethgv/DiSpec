@@ -15,6 +15,10 @@ target run normally, next to the same agreement for the small source model alone
 the baseline that says whether escalating bought anything. Greedy agreement is a
 coarse signal (bf16 near-ties flip tokens); kvxfer measures quality properly.
 
+Both engines run DiSpec's serving fast path by default (Triton decode kernel + fused
+GEMMs, as `dispec.router.app` serves), so the one-token inject is timed the way it would
+actually run; `--attn-backend native` measures the plain PyTorch path.
+
 Needs both models on one GPU (~11.5 GB bf16) plus maps from kvxfer.
 
 Run: python -m bench.kvxfer_bench --artifacts <kvxfer pair dir containing maps/ and residual/>
@@ -158,6 +162,8 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, default=5)
     ap.add_argument("--new-tokens", type=int, default=32)
     ap.add_argument("--out", default="kvxfer_bench.json")
+    ap.add_argument("--attn-backend", choices=("triton", "native"), default="triton",
+                    help="triton = the server's fast path (Triton decode + fused GEMMs)")
     args = ap.parse_args()
 
     lengths = [int(x) for x in args.lengths.split(",")]
@@ -168,8 +174,12 @@ def main() -> None:
     src = load_model(KVXFER_SOURCE_MODEL)
     tgt = load_model(KVXFER_TARGET_MODEL)
     tok = load_tokenizer(KVXFER_TARGET_MODEL)
-    src_eng = ContinuousBatchingEngine(src, num_blocks=blocks, max_batch_tokens=max(lengths))
-    tgt_eng = ContinuousBatchingEngine(tgt, num_blocks=blocks, max_batch_tokens=max(lengths))
+    fast = args.attn_backend == "triton"
+    # fuse=True rewrites each model's projections in place; each engine has its own model.
+    src_eng = ContinuousBatchingEngine(src, num_blocks=blocks, max_batch_tokens=max(lengths),
+                                       attn_backend=args.attn_backend, fuse=fast)
+    tgt_eng = ContinuousBatchingEngine(tgt, num_blocks=blocks, max_batch_tokens=max(lengths),
+                                       attn_backend=args.attn_backend, fuse=fast)
     art = Path(args.artifacts)
     kv_map = CrossModelKVMap.load(art / "maps", src.config, tgt.config,
                                   residual_dir=art / "residual", device="cuda",
@@ -177,6 +187,7 @@ def main() -> None:
 
     result = {"source": KVXFER_SOURCE_MODEL, "target": KVXFER_TARGET_MODEL,
               "gpu": torch.cuda.get_device_name(), "dtype": str(tgt_eng.runner.dtype),
+              "attn_backend": args.attn_backend, "fused": fast,
               "repeats": args.repeats, "points": []}
 
     # The first-ever calls pay for allocator growth and kernel selection. Without a
@@ -184,7 +195,8 @@ def main() -> None:
     # length's (138 ms at 512 tokens vs 104 ms at 1024).
     bench_latency(src_eng, tgt_eng, kv_map, min(lengths), repeats=1)
 
-    print(f"{KVXFER_SOURCE_MODEL} -> {KVXFER_TARGET_MODEL} on {result['gpu']}")
+    print(f"{KVXFER_SOURCE_MODEL} -> {KVXFER_TARGET_MODEL} on {result['gpu']} "
+          f"({args.attn_backend}{' + fused' if fast else ''})")
     print(f"{'tokens':>7} {'tgt prefill':>12} {'src prefill':>12} "
           f"{'ridge warm':>11} {'x':>6} {'resid warm':>11} {'x':>6} {'resid cold':>11} {'x':>6}")
     for n in lengths:
