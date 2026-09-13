@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "DiSpec: a from-scratch LLM inference engine — paged attention, continuous batching, CUDA graphs, speculative decoding, and prefill/decode disaggregation"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.4",
+    "torch>=2.5",  # SDPA enable_gqa and lower-right CausalBias
     "transformers>=4.51",  # first release with Qwen3
     "accelerate>=0.33",
     "safetensors>=0.4",
