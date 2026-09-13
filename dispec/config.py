@@ -18,6 +18,13 @@ DRAFT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 # draft, which lossless speculative decoding requires.
 TARGET_MODEL_GPTQ = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
 
+# Cross-model KV transfer pair (dispec/kv/transfer.py). The trained kvxfer converter
+# maps Qwen3-1.7B's KV cache into Qwen3-4B's: both have 8 KV heads x 128 dims and one
+# tokenizer, which the map requires. Not the default pair -- the two models together
+# are ~11.5 GB in bf16, over the 8 GB budget the defaults above are sized for.
+KVXFER_SOURCE_MODEL = "Qwen/Qwen3-1.7B"
+KVXFER_TARGET_MODEL = "Qwen/Qwen3-4B"
+
 DTYPE = "bfloat16"
 
 
