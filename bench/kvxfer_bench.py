@@ -161,7 +161,10 @@ def main() -> None:
     args = ap.parse_args()
 
     lengths = [int(x) for x in args.lengths.split(",")]
-    blocks = (max(lengths) + 64) // 16 * 2 + 64  # a kept source seq + a timed one
+    # Each engine holds at most one long sequence at a time: timed prefills free before
+    # the kept source sequence is allocated, and the target never holds a timed prefill
+    # and an injection together. The extra blocks are for the quality prompts.
+    blocks = (max(lengths) + 15) // 16 + 64
     src = load_model(KVXFER_SOURCE_MODEL)
     tgt = load_model(KVXFER_TARGET_MODEL)
     tok = load_tokenizer(KVXFER_TARGET_MODEL)
@@ -175,6 +178,11 @@ def main() -> None:
     result = {"source": KVXFER_SOURCE_MODEL, "target": KVXFER_TARGET_MODEL,
               "gpu": torch.cuda.get_device_name(), "dtype": str(tgt_eng.runner.dtype),
               "repeats": args.repeats, "points": []}
+
+    # The first-ever calls pay for allocator growth and kernel selection. Without a
+    # discarded pass, the first length's ridge timing came out slower than the next
+    # length's (138 ms at 512 tokens vs 104 ms at 1024).
+    bench_latency(src_eng, tgt_eng, kv_map, min(lengths), repeats=1)
 
     print(f"{KVXFER_SOURCE_MODEL} -> {KVXFER_TARGET_MODEL} on {result['gpu']}")
     print(f"{'tokens':>7} {'tgt prefill':>12} {'src prefill':>12} "
